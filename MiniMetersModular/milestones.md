@@ -1,5 +1,6 @@
 - [x] OTA updater on both ESP32 Waveshare nodes (ArduinoOTA + ElegantOTA) — tag 0.1.2
-- [x] ESP-NOW mesh: any node's /control page sets viz mode, LED color, and LED brightness on the others (saved in NVS)
+- [x] ESP-NOW mesh: viz mode is per node, LED color and brightness are shared (saved in NVS)
+- [x] Headless ESP32-S3 conductor target (UDP audio, display skipped)
 - [x] Conductor ingests 16 kHz PCM over UDP, runs FFT + K-weighted loudness, broadcasts viz frames
 - [ ] USB Audio Interface to DAC
 - [ ] USB Audio visualizations (local USB instead of UDP)

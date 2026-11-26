@@ -2,7 +2,7 @@
 
 Embedded MiniMeters-style audio meters on ESP32 and nRF devkits, with common SPI displays (ILI9341, ST7789, GC9A01).
 
-One node is the conductor. It takes 16 kHz PCM over UDP, runs the FFT and loudness, and broadcasts a small frame over ESP-NOW. Every other node renders that frame. Any node's `/control` page can push the visualizer, LED color, and LED brightness to the rest of the mesh. A DAC on each node is still planned.
+One node is the conductor. It takes 16 kHz PCM over UDP, runs the FFT and loudness, and broadcasts a small frame over ESP-NOW. Every other node renders that frame in its own visualizer. LED color and brightness are shared. Any node's page can set those, and can set each node's visualizer and role from that node's card. A DAC on each node is still planned. The ESP32-S3 build is the headless conductor.
 
 ESP-NOW rides the Wi-Fi radio, so both boards have to join the same access point (they already do). The C6's 802.15.4 radio can run Thread later for a cable-free audio fabric; viz frames and config fit in ESP-NOW's 250-byte payload, which keeps the web UI and OTA on the stack that is already working.
 
@@ -42,7 +42,15 @@ Both Waveshare ESP32-C6 boards run one shared firmware image:
 
    `python stream_audio.py 192.168.1.224 --tone 440` sends a stereo sine if you do not have a capture device yet.
 
-3. Change the visualizer, LED color, or LED brightness on **either** node's `/control` page. The change is stored in NVS and broadcast. A node that boots later picks up the highest settings revision from the next hello.
+3. Open `/` or `/control`. Each node is a card. The card you are on is marked **this node**. Pick that card's visualizer and role there. LED color and brightness sit under the cards and apply to every node. Hover **status** on a card for firmware, address, role, and visualizer. Each card links to that node's control page and `/update`.
+
+### ESP32-S3 conductor
+
+```bash
+pio run -e conductor_s3 -t upload
+```
+
+That target has no SPI panel, so it boots headless and still joins Wi-Fi, the mesh, and the web page. It defaults to conductor. Stream to it with the same `stream_audio.py` command. USB Audio Class is the next source for this board. The Arduino core's TinyUSB build does not include the audio class, so 1.4.1 keeps the S3 on the UDP stream.
 
 Wi-Fi modem sleep is off while this firmware runs. ESP-NOW drops frames when the STA radio is dozing, and these boards are on USB power.
 

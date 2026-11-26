@@ -7,6 +7,8 @@
 static_assert(sizeof(MeshViz) <= 250, "viz packet exceeds ESP-NOW");
 static_assert(sizeof(MeshHello) <= 250, "hello packet exceeds ESP-NOW");
 static_assert(sizeof(MeshConfig) <= 250, "config packet exceeds ESP-NOW");
+static_assert(sizeof(MeshSetMode) <= 250, "mode packet exceeds ESP-NOW");
+static_assert(sizeof(MeshSetRole) <= 250, "role packet exceeds ESP-NOW");
 
 static const uint8_t kBcast[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
 static const uint32_t kPeerTimeoutMs = 5000;
@@ -39,6 +41,12 @@ static PeerSlot g_peers[kMaxPeers];
 static QueueHandle_t g_rxQueue = nullptr;
 static MeshConfigFn g_onConfig = nullptr;
 static MeshClaimFn g_onClaim = nullptr;
+static MeshModeFn g_onMode = nullptr;
+static MeshRoleFn g_onRole = nullptr;
+static uint8_t g_directMac[6];
+static uint8_t g_directData[8];
+static uint8_t g_directLen = 0;
+static uint8_t g_directLeft = 0;
 static bool g_ok = false;
 static volatile bool g_txBusy = false;
 static uint32_t g_txStamp = 0;
@@ -77,17 +85,61 @@ static void onRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len
   xQueueSend(g_rxQueue, &item, 0);
 }
 
-static bool sendRaw(const uint8_t *data, size_t len) {
-  if (!g_ok || g_txBusy || len == 0 || len > 250) {
+static bool sendPkt(const uint8_t *mac, const uint8_t *data, size_t len) {
+  if (!g_ok || !mac || g_txBusy || len == 0 || len > 250) {
     return false;
   }
   g_txBusy = true;
   g_txStamp = millis();
-  if (esp_now_send(kBcast, data, len) != ESP_OK) {
+  if (esp_now_send(mac, data, len) != ESP_OK) {
     g_txBusy = false;
     return false;
   }
   return true;
+}
+
+static bool sendRaw(const uint8_t *data, size_t len) {
+  return sendPkt(kBcast, data, len);
+}
+
+static void ensurePeer(const uint8_t mac[6]) {
+  if (!g_ok || esp_now_is_peer_exist(mac)) {
+    return;
+  }
+  esp_now_peer_info_t peer;
+  memset(&peer, 0, sizeof(peer));
+  memcpy(peer.peer_addr, mac, 6);
+  peer.channel = 0;
+  peer.ifidx = WIFI_IF_STA;
+  peer.encrypt = false;
+  const esp_err_t add = esp_now_add_peer(&peer);
+  if (add != ESP_OK && add != ESP_ERR_ESPNOW_EXIST) {
+    Serial.printf("esp-now peer add failed %d\n", (int)add);
+  }
+}
+
+static void notePeer(const uint8_t mac[6], int mode, int role) {
+  for (int i = 0; i < kMaxPeers; ++i) {
+    if (!g_peers[i].used || memcmp(g_peers[i].mac, mac, 6) != 0) {
+      continue;
+    }
+    if (mode >= 0) {
+      g_peers[i].info.mode = (uint8_t)mode;
+    }
+    if (role >= 0) {
+      g_peers[i].info.role = (uint8_t)role;
+    }
+  }
+}
+
+static void queueDirect(const uint8_t mac[6], const void *pkt, uint8_t len) {
+  if (len > sizeof(g_directData)) {
+    len = sizeof(g_directData);
+  }
+  memcpy(g_directMac, mac, 6);
+  memcpy(g_directData, pkt, len);
+  g_directLen = len;
+  g_directLeft = 3;
 }
 
 static void agePeers(uint32_t now) {
@@ -166,7 +218,6 @@ static bool sendConfigNow() {
   MeshConfig pkt;
   memset(&pkt, 0, sizeof(pkt));
   fillHeader(&pkt.magic, &pkt.ver, &pkt.type, MESH_CONFIG);
-  pkt.mode = g_id.mode;
   pkt.led_r = g_id.r;
   pkt.led_g = g_id.g;
   pkt.led_b = g_id.b;
@@ -200,6 +251,7 @@ static void handlePacket(const RxItem &item) {
     hello.name[sizeof(hello.name) - 1] = 0;
     PeerSlot *slot = allocPeer(item.mac);
     const bool fresh = slot->info.name[0] == 0;
+    memcpy(slot->info.mac, item.mac, 6);
     slot->info.role = hello.role;
     slot->info.mode = hello.mode;
     memcpy(slot->info.ip, hello.ip, 4);
@@ -214,8 +266,9 @@ static void handlePacket(const RxItem &item) {
     if (fresh) {
       Serial.printf("mesh peer %s rssi=%d\n", slot->info.name, item.rssi);
     }
+    ensurePeer(item.mac);
     if (g_onConfig) {
-      g_onConfig(hello.mode, hello.led_r, hello.led_g, hello.led_b, hello.led_bri, hello.rev);
+      g_onConfig(hello.led_r, hello.led_g, hello.led_b, hello.led_bri, hello.rev);
     }
     return;
   }
@@ -224,7 +277,25 @@ static void handlePacket(const RxItem &item) {
     MeshConfig cfg;
     memcpy(&cfg, item.data, sizeof(cfg));
     if (g_onConfig) {
-      g_onConfig(cfg.mode, cfg.led_r, cfg.led_g, cfg.led_b, cfg.led_bri, cfg.rev);
+      g_onConfig(cfg.led_r, cfg.led_g, cfg.led_b, cfg.led_bri, cfg.rev);
+    }
+    return;
+  }
+
+  if (type == MESH_SET_MODE && item.len >= sizeof(MeshSetMode)) {
+    MeshSetMode pkt;
+    memcpy(&pkt, item.data, sizeof(pkt));
+    if (pkt.mode < MODE_COUNT && g_onMode) {
+      g_onMode(pkt.mode);
+    }
+    return;
+  }
+
+  if (type == MESH_SET_ROLE && item.len >= sizeof(MeshSetRole)) {
+    MeshSetRole pkt;
+    memcpy(&pkt, item.data, sizeof(pkt));
+    if (g_onRole) {
+      g_onRole(pkt.role);
     }
     return;
   }
@@ -270,9 +341,11 @@ void meshSetIdentity(const char *name, uint8_t role, uint8_t mode, uint8_t r, ui
   g_id.rev = rev;
 }
 
-void meshBegin(MeshConfigFn onConfig, MeshClaimFn onClaim) {
+void meshBegin(MeshConfigFn onConfig, MeshClaimFn onClaim, MeshModeFn onMode, MeshRoleFn onRole) {
   g_onConfig = onConfig;
   g_onClaim = onClaim;
+  g_onMode = onMode;
+  g_onRole = onRole;
   g_rxQueue = xQueueCreate(8, sizeof(RxItem));
   if (!g_rxQueue) {
     Serial.println("esp-now queue failed");
@@ -321,6 +394,13 @@ void meshPollTx(uint32_t now) {
   if (g_txBusy && (now - g_txStamp) > 40) {
     g_txBusy = false;
   }
+  if (g_directLeft && g_directLen) {
+    ensurePeer(g_directMac);
+    if (sendPkt(g_directMac, g_directData, g_directLen)) {
+      --g_directLeft;
+    }
+    return;
+  }
   if (g_configLeft && now >= g_nextConfig) {
     if (sendConfigNow()) {
       if (g_configLeft) {
@@ -359,6 +439,41 @@ void meshSendClaim() {
 
 void meshAnnounce() {
   g_helloDue = true;
+}
+
+void meshSendSetMode(const uint8_t mac[6], uint8_t mode) {
+  MeshSetMode pkt;
+  memset(&pkt, 0, sizeof(pkt));
+  fillHeader(&pkt.magic, &pkt.ver, &pkt.type, MESH_SET_MODE);
+  pkt.mode = mode;
+  queueDirect(mac, &pkt, sizeof(pkt));
+  notePeer(mac, mode, -1);
+}
+
+void meshSendSetRole(const uint8_t mac[6], uint8_t role) {
+  MeshSetRole pkt;
+  memset(&pkt, 0, sizeof(pkt));
+  fillHeader(&pkt.magic, &pkt.ver, &pkt.type, MESH_SET_ROLE);
+  pkt.role = role;
+  queueDirect(mac, &pkt, sizeof(pkt));
+  notePeer(mac, -1, role);
+}
+
+bool meshFindPeer(const char *name, MeshPeerInfo *out) {
+  if (!name || !name[0] || !out) {
+    return false;
+  }
+  agePeers(millis());
+  for (int i = 0; i < kMaxPeers; ++i) {
+    if (!g_peers[i].used) {
+      continue;
+    }
+    if (strcmp(g_peers[i].info.name, name) == 0) {
+      *out = g_peers[i].info;
+      return true;
+    }
+  }
+  return false;
 }
 
 void meshSendViz(const VizFrame &frame) {

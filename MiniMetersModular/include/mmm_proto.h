@@ -6,13 +6,15 @@
 // firmware and join the same Wi-Fi AP, so they are already on one channel.
 
 static const uint8_t kMeshMagic = 0xA5;
-static const uint8_t kMeshVer = 1;
+static const uint8_t kMeshVer = 2;
 
 enum MeshType : uint8_t {
   MESH_HELLO = 1,
-  MESH_CONFIG = 2,
-  MESH_CLAIM = 3,
+  MESH_CONFIG = 2,     // LED color and brightness, every node
+  MESH_CLAIM = 3,      // sender is the conductor
   MESH_VIZ = 4,
+  MESH_SET_MODE = 5,   // unicast: set this node's visualizer
+  MESH_SET_ROLE = 6,   // unicast: set this node's role
 };
 
 enum NodeRole : uint8_t {
@@ -72,12 +74,25 @@ struct MeshConfig {
   uint8_t magic;
   uint8_t ver;
   uint8_t type;
-  uint8_t mode;
   uint8_t led_r;
   uint8_t led_g;
   uint8_t led_b;
   uint8_t led_bri;
   uint32_t rev;
+};
+
+struct MeshSetMode {
+  uint8_t magic;
+  uint8_t ver;
+  uint8_t type;
+  uint8_t mode;
+};
+
+struct MeshSetRole {
+  uint8_t magic;
+  uint8_t ver;
+  uint8_t type;
+  uint8_t role;
 };
 
 struct MeshClaim {

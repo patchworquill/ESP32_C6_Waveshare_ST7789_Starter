@@ -23,9 +23,23 @@ static WebServer server(80);
 static LGFX tft;
 static Preferences prefs;
 
-#define RGB_LED_PIN 8
+#ifndef MMM_LED_PIN
+#define MMM_LED_PIN 8
+#endif
+#ifndef MMM_HEADLESS
+#define MMM_HEADLESS 0
+#endif
+#ifndef MMM_DEFAULT_ROLE
+#define MMM_DEFAULT_ROLE ROLE_NODE
+#endif
+#ifndef MMM_PREFERRED_CONDUCTOR
+#define MMM_PREFERRED_CONDUCTOR 0
+#endif
+
+#define RGB_LED_PIN MMM_LED_PIN
 #define NUM_LEDS 1
 static CRGB leds[NUM_LEDS];
+static bool g_display = false;
 
 // Display backlight stays at a fixed modest level. The web control is the
 // onboard RGB LED, which is bright enough to wash out the panel if left at 100%.
@@ -185,7 +199,7 @@ static void loadSettings() {
   g_ledG = prefs.getUChar("led_g", 69);
   g_ledB = prefs.getUChar("led_b", 0);
   g_ledBri = prefs.getUChar("led_bri", 4);
-  g_role = prefs.getUChar("role", ROLE_NODE);
+  g_role = prefs.getUChar("role", MMM_DEFAULT_ROLE);
   g_rev = prefs.getUInt("rev", 0);
   prefs.end();
   if (g_screenIndex < 0 || g_screenIndex >= MODE_COUNT) {
@@ -215,14 +229,18 @@ static void showWaiting() {
   g_vizDirty = true;
 }
 
-static void applyShared(int mode, uint8_t r, uint8_t g, uint8_t b, uint8_t bri, uint32_t rev,
-                        bool broadcast) {
+static void applyLocalMode(int mode) {
+  setScreen(mode);
+  saveSettings();
+  publishIdentity(true);
+}
+
+static void applyLedMesh(uint8_t r, uint8_t g, uint8_t b, uint8_t bri, uint32_t rev, bool broadcast) {
   g_ledR = r;
   g_ledG = g;
   g_ledB = b;
   g_ledBri = bri;
   g_rev = rev;
-  setScreen(mode);
   applyLed();
   saveSettings();
   publishIdentity(broadcast);
@@ -231,12 +249,32 @@ static void applyShared(int mode, uint8_t r, uint8_t g, uint8_t b, uint8_t bri, 
   }
 }
 
-static void onMeshConfig(uint8_t mode, uint8_t r, uint8_t g, uint8_t b, uint8_t bri, uint32_t rev) {
-  if (mode >= MODE_COUNT || rev <= g_rev) {
+static void onMeshConfig(uint8_t r, uint8_t g, uint8_t b, uint8_t bri, uint32_t rev) {
+  if (rev <= g_rev) {
     return;
   }
-  Serial.printf("mesh config rev=%u mode=%u led=%u,%u,%u bri=%u\n", rev, mode, r, g, b, bri);
-  applyShared(mode, r, g, b, bri, rev, false);
+  Serial.printf("mesh led rev=%u rgb=%u,%u,%u bri=%u\n", rev, r, g, b, bri);
+  applyLedMesh(r, g, b, bri, rev, false);
+}
+
+static void onMeshMode(uint8_t mode) {
+  if (mode >= MODE_COUNT) {
+    return;
+  }
+  Serial.printf("mesh set viz %s\n", modeName(mode));
+  applyLocalMode(mode);
+}
+
+static void becomeConductor() {
+  g_claimGuardUntil = millis() + 3000;
+  if (g_role != ROLE_CONDUCTOR) {
+    g_role = ROLE_CONDUCTOR;
+    audioSetConductor(true);
+    saveSettings();
+    showWaiting();
+  }
+  publishIdentity(true);
+  meshSendClaim();
 }
 
 static void becomeNode() {
@@ -251,6 +289,16 @@ static void becomeNode() {
   publishIdentity(true);
 }
 
+static void onMeshRole(uint8_t role) {
+  if (role == ROLE_CONDUCTOR) {
+    Serial.println("mesh set role conductor");
+    becomeConductor();
+  } else {
+    Serial.println("mesh set role node");
+    becomeNode();
+  }
+}
+
 static void onMeshClaim() {
   if ((int32_t)(millis() - g_claimGuardUntil) < 0) {
     return;
@@ -259,6 +307,10 @@ static void onMeshClaim() {
 }
 
 static void resolveConductorRole(uint32_t now) {
+#if MMM_PREFERRED_CONDUCTOR
+  (void)now;
+  return;
+#else
   if (g_role != ROLE_CONDUCTOR) {
     return;
   }
@@ -269,6 +321,7 @@ static void resolveConductorRole(uint32_t now) {
     Serial.println("mesh: deferring to the other conductor");
     becomeNode();
   }
+#endif
 }
 
 static void drawModeLabel() {
@@ -503,6 +556,9 @@ static void clearVizArea() {
 }
 
 static void drawInfoOverlay(const char *wifiLine) {
+  if (!g_display) {
+    return;
+  }
   tft.fillScreen(colBg);
   useMonoFont();
 
@@ -541,6 +597,9 @@ static void drawInfoOverlay(const char *wifiLine) {
 }
 
 static void drawBootConnecting(const char *wifiLine) {
+  if (!g_display) {
+    return;
+  }
   tft.fillScreen(TFT_BLACK);
   tft.setFont(&fonts::Font0);
   tft.setTextSize(1);
@@ -554,11 +613,17 @@ static void drawBootConnecting(const char *wifiLine) {
 }
 
 static void setupDisplay() {
+#if MMM_HEADLESS
+  g_display = false;
+  Serial.println("display: headless");
+#else
   tft.init();
   tft.setRotation(1);
   tft.setBrightness(displayBrightnessByte(kDisplayBrightnessPercent));
   initPalette();
+  g_display = true;
   drawBootConnecting("wifi...");
+#endif
 }
 
 static void connectWifi() {
@@ -641,43 +706,96 @@ static void sendNoStore() {
   server.sendHeader("Cache-Control", "no-store");
 }
 
-static void sendStatusPage() {
-  String ip = WiFi.localIP().toString();
-  String body;
-  body.reserve(1024);
-  body += F("<!doctype html><html><head><meta charset=utf-8>");
-  body += F("<meta name=viewport content=\"width=device-width,initial-scale=1\">");
-  body += F("<title>MiniMeters Modular</title><style>");
-  body += F("body{background:#000;color:#fff;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;");
-  body += F("margin:2rem;line-height:1.5} a{color:#ACC0DE} .muted{color:#56606F} .v{color:#ACC0DE}");
-  body += F("</style></head><body>");
-  body += F("<h1>MiniMeters Modular</h1>");
-  body += F("<p class=muted>firmware</p><p class=v>");
-  body += htmlEscape(kFirmwareVersion);
-  body += F("</p><p class=muted>hostname</p><p class=v>");
-  body += htmlEscape(hostname);
-  body += F("</p><p class=muted>role</p><p class=v>");
-  body += roleName(g_role);
-  body += F("</p><p class=muted>network</p><p class=v>");
+static void appendNodeCard(String &body, const char *name, bool self, uint8_t role, uint8_t mode,
+                           const char *ip, int rssi, bool showRssi) {
+  body += F("<article class=\"card");
+  if (self) {
+    body += F(" self");
+  }
+  body += F("\"><header><h2>");
+  body += htmlEscape(name);
+  if (self) {
+    body += F("<span class=badge>this node</span>");
+  }
+  body += F("</h2><span class=tip tabindex=0>status<span class=tipbox>");
+  if (self) {
+    body += F("firmware ");
+    body += htmlEscape(kFirmwareVersion);
+    body += F("<br>");
+  }
+  body += htmlEscape(name);
+  body += F("<br>");
   body += htmlEscape(ip);
-  body += F("</p><p class=muted>viz</p><p class=v>");
-  body += htmlEscape(modeName(g_screenIndex));
-  body += F("</p><p class=muted>mesh</p><p class=v>");
-  body += meshReady() ? "esp-now" : "offline";
+  body += F("<br>");
+  body += roleName(role);
   body += F(" · ");
-  body += String(meshPeerCount());
-  body += F(" peers</p>");
-  if (g_role == ROLE_CONDUCTOR) {
-    body += F("<p class=muted>audio</p><p class=v>udp://");
+  body += htmlEscape(modeName(mode));
+  if (self) {
+    body += F("<br>");
+    body += meshReady() ? "esp-now" : "esp-now offline";
+    body += F(" · ");
+    body += String(meshPeerCount());
+    body += F(" peers");
+  } else if (showRssi) {
+    body += F("<br>");
+    body += String(rssi);
+    body += F(" dBm");
+  }
+  body += F("</span></span></header>");
+
+  body += F("<p class=ip>");
+  body += htmlEscape(ip);
+  body += F("</p>");
+
+  body += F("<p class=k>role</p><p class=pills>");
+  body += F("<a class=\"pill");
+  if (role == ROLE_CONDUCTOR) {
+    body += F(" active");
+  }
+  body += F("\" href=\"/control?node=");
+  body += htmlEscape(name);
+  body += F("&role=conductor\">Conductor</a><a class=\"pill");
+  if (role == ROLE_NODE) {
+    body += F(" active");
+  }
+  body += F("\" href=\"/control?node=");
+  body += htmlEscape(name);
+  body += F("&role=node\">Node</a></p>");
+
+  body += F("<p class=k>viz</p><p class=pills>");
+  for (int i = 0; i < MODE_COUNT; ++i) {
+    body += F("<a class=\"pill");
+    if (i == (int)mode) {
+      body += F(" active");
+    }
+    body += F("\" href=\"/control?node=");
+    body += htmlEscape(name);
+    body += F("&mode=");
+    body += String(i);
+    body += F("\">");
+    body += htmlEscape(kModeNames[i]);
+    body += F("</a>");
+  }
+  body += F("</p>");
+
+  if (role == ROLE_CONDUCTOR && ip[0]) {
+    body += F("<p class=k>stream</p><p class=v>udp://");
     body += htmlEscape(ip);
     body += F(":");
     body += String(kAudioUdpPort);
+    body += F("</p><p class=muted>python stream_audio.py ");
+    body += htmlEscape(ip);
     body += F("</p>");
   }
-  body += F("<p><a href=/control>control</a> &nbsp; <a href=/update>ota /update</a></p>");
-  body += F("</body></html>");
-  sendNoStore();
-  server.send(200, "text/html", body);
+
+  if (ip[0]) {
+    body += F("<p class=links><a href=\"http://");
+    body += ip;
+    body += F("/control\">control</a><a href=\"http://");
+    body += ip;
+    body += F("/update\">ota /update</a></p>");
+  }
+  body += F("</article>");
 }
 
 static void sendControlPage() {
@@ -686,114 +804,62 @@ static void sendControlPage() {
   snprintf(color, sizeof(color), "#%02x%02x%02x", g_ledR, g_ledG, g_ledB);
 
   String body;
-  body.reserve(4096);
+  body.reserve(8192);
   body += F("<!doctype html><html><head><meta charset=utf-8>");
   body += F("<meta name=viewport content=\"width=device-width,initial-scale=1\">");
-  body += F("<title>Control — MiniMeters</title><style>");
+  body += F("<title>MiniMeters Modular</title><style>");
   body += F("body{background:#000;color:#fff;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;");
-  body += F("margin:2rem;line-height:1.5} a{color:#ACC0DE;text-decoration:none}");
-  body += F(".muted{color:#56606F} .v{color:#ACC0DE}");
-  body += F(".btn,button.btn{display:block;padding:.75rem 1rem;margin:.4rem 0;width:100%;box-sizing:border-box;");
-  body += F("border:1px solid #56606F;color:#ACC0DE;background:#000;font:inherit;text-align:left;cursor:pointer}");
-  body += F(".btn.active{background:#2B3037;border-color:#ACC0DE;color:#fff}");
-  body += F("input[type=color]{background:#000;border:1px solid #56606F;height:2.4rem;width:4rem;padding:0}");
-  body += F("input[type=range]{width:100%;accent-color:#ACC0DE}");
-  body += F(".ver{color:#56606F;font-size:11px;margin-top:2.5rem}");
+  body += F("margin:1.5rem;line-height:1.45} a{color:#ACC0DE;text-decoration:none}");
+  body += F("h1{font-size:1.25rem;font-weight:500;margin:0 0 .25rem} h2{font-size:1rem;font-weight:500;margin:0}");
+  body += F(".muted{color:#56606F} .v{color:#ACC0DE} .k{color:#56606F;margin:.8rem 0 .25rem}");
+  body += F(".cards{display:flex;flex-wrap:wrap;gap:1rem;margin-top:1.25rem}");
+  body += F(".card{flex:1 1 260px;border:1px solid #56606F;padding:1rem;box-sizing:border-box}");
+  body += F(".card.self{border-color:#ACC0DE}");
+  body += F("header{display:flex;justify-content:space-between;align-items:flex-start;gap:.75rem}");
+  body += F(".badge{margin-left:.5rem;color:#ACC0DE;font-size:11px;border:1px solid #ACC0DE;padding:.1rem .35rem}");
+  body += F(".ip{color:#ACC0DE;margin:.4rem 0 0}");
+  body += F(".pills{display:flex;flex-wrap:wrap;gap:.35rem;margin:0}");
+  body += F(".pill{border:1px solid #56606F;color:#ACC0DE;padding:.3rem .5rem;font-size:12px}");
+  body += F(".pill.active{background:#2B3037;border-color:#ACC0DE;color:#fff}");
+  body += F(".links{margin:1rem 0 0}.links a{margin-right:1rem}");
+  body += F(".tip{position:relative;color:#56606F;font-size:11px;cursor:help;border-bottom:1px dotted #56606F}");
+  body += F(".tipbox{display:none;position:absolute;z-index:2;right:0;top:1.3rem;background:#2B3037;color:#fff;");
+  body += F("padding:.6rem .75rem;min-width:12rem;font-size:12px;line-height:1.45}");
+  body += F(".tip:hover .tipbox,.tip:focus .tipbox{display:block}");
+  body += F("input[type=color]{background:#000;border:1px solid #56606F;height:2.2rem;width:3.2rem;padding:0}");
+  body += F("input[type=range]{width:16rem;max-width:100%;accent-color:#ACC0DE}");
+  body += F("button{font:inherit;background:#000;color:#ACC0DE;border:1px solid #56606F;padding:.45rem .7rem;cursor:pointer}");
+  body += F(".led{margin-top:1.5rem;padding-top:1rem;border-top:1px solid #2B3037}");
+  body += F(".ver{color:#56606F;font-size:11px;margin-top:2rem}");
   body += F("</style></head><body>");
-  body += F("<h1>Control</h1>");
-  body += F("<p>");
-  body += htmlEscape(hostname);
-  body += F(" <span class=muted>this node · ");
-  body += roleName(g_role);
-  body += F(" · ");
-  body += htmlEscape(ip);
-  body += F("</span></p>");
-  body += F("<p class=muted>Mode, LED color, and brightness are saved here and pushed to every node.</p>");
+  body += F("<h1>MiniMeters Modular</h1>");
+  body += F("<p class=muted>Each node keeps its own visualizer. LED color and brightness apply to every node.</p>");
 
-  body += F("<p class=muted>viz mode</p>");
-  for (int i = 0; i < MODE_COUNT; ++i) {
-    body += F("<a class=\"btn");
-    if (i == g_screenIndex) {
-      body += F(" active");
-    }
-    body += F("\" href=\"/control?mode=");
-    body += String(i);
-    body += F("\">");
-    body += htmlEscape(kModeNames[i]);
-    if (i == g_screenIndex) {
-      body += F("  ←");
-    }
-    body += F("</a>");
+  body += F("<div class=cards>");
+  appendNodeCard(body, hostname, true, g_role, (uint8_t)g_screenIndex, ip.c_str(), 0, false);
+  MeshPeerInfo peers[8];
+  const int n = meshCopyPeers(peers, 8);
+  for (int i = 0; i < n; ++i) {
+    char ipbuf[20];
+    snprintf(ipbuf, sizeof(ipbuf), "%u.%u.%u.%u", peers[i].ip[0], peers[i].ip[1], peers[i].ip[2],
+             peers[i].ip[3]);
+    const char *peerName = peers[i].name[0] ? peers[i].name : "peer";
+    appendNodeCard(body, peerName, false, peers[i].role, peers[i].mode, ipbuf, peers[i].rssi, true);
   }
+  body += F("</div>");
 
-  body += F("<form action=/control method=get>");
-  body += F("<p class=muted>led</p>");
+  body += F("<form class=led action=/control method=get>");
+  body += F("<p class=k>led, all nodes</p>");
   body += F("<p><input type=color name=led value=\"");
   body += color;
-  body += F("\"></p>");
-  body += F("<p class=muted>brightness <span id=bv>");
+  body += F("\"> <span class=muted>brightness <span id=bv>");
   body += String(g_ledBri);
-  body += F("</span>%</p>");
-  body += F("<input id=bri type=range name=bri min=0 max=100 value=\"");
+  body += F("</span>%</span></p>");
+  body += F("<p><input id=bri type=range name=bri min=0 max=100 value=\"");
   body += String(g_ledBri);
-  body += F("\">");
-  body += F("<button class=btn type=submit>Apply LED to mesh</button>");
-  body += F("</form>");
+  body += F("\"> <button type=submit>Apply LED</button></p></form>");
   body += F("<script>var b=document.getElementById('bri'),o=document.getElementById('bv');");
-  body += F("b.oninput=function(){o.textContent=b.value}</script>");
-
-  body += F("<p class=muted>role</p>");
-  body += F("<a class=\"btn");
-  if (g_role == ROLE_CONDUCTOR) {
-    body += F(" active");
-  }
-  body += F("\" href=\"/control?role=conductor\">Conductor</a>");
-  body += F("<a class=\"btn");
-  if (g_role == ROLE_NODE) {
-    body += F(" active");
-  }
-  body += F("\" href=\"/control?role=node\">Node</a>");
-  body += F("<p class=muted>One conductor runs the FFT and feeds the other nodes. Choosing Conductor demotes the rest.</p>");
-  if (g_role == ROLE_CONDUCTOR) {
-    body += F("<p class=v>udp://");
-    body += htmlEscape(ip);
-    body += F(":");
-    body += String(kAudioUdpPort);
-    body += F("</p>");
-  }
-
-  body += F("<p class=muted>nodes</p>");
-  if (!meshReady()) {
-    body += F("<p class=muted>ESP-NOW is offline on this node.</p>");
-  } else {
-    MeshPeerInfo peers[8];
-    const int n = meshCopyPeers(peers, 8);
-    if (n == 0) {
-      body += F("<p class=muted>none yet</p>");
-    }
-    for (int i = 0; i < n; ++i) {
-      char ipbuf[20];
-      snprintf(ipbuf, sizeof(ipbuf), "%u.%u.%u.%u", peers[i].ip[0], peers[i].ip[1], peers[i].ip[2],
-               peers[i].ip[3]);
-      body += F("<p>");
-      body += htmlEscape(peers[i].name[0] ? peers[i].name : "?");
-      body += F(" <span class=muted>");
-      body += roleName(peers[i].role);
-      body += F(" · ");
-      body += htmlEscape(modeName(peers[i].mode));
-      body += F(" · ");
-      body += String((int)peers[i].rssi);
-      body += F(" dBm</span>");
-      if (peers[i].ip[0] || peers[i].ip[1] || peers[i].ip[2] || peers[i].ip[3]) {
-        body += F(" <a href=\"http://");
-        body += ipbuf;
-        body += F("/control\">open</a>");
-      }
-      body += F("</p>");
-    }
-  }
-
-  body += F("<p style=\"margin-top:1.5rem\"><a href=/>status</a></p>");
+  body += F("if(b&&o)b.oninput=function(){o.textContent=b.value}</script>");
   body += F("<p class=ver>firmware ");
   body += htmlEscape(kFirmwareVersion);
   body += F("</p></body></html>");
@@ -831,20 +897,28 @@ static void redirectControl() {
 }
 
 static void handleControl() {
-  bool changed = false;
-  int mode = g_screenIndex;
+  const bool forPeer = server.hasArg("node") && server.arg("node") != hostname;
+  MeshPeerInfo peer;
+  const bool peerOk = forPeer && meshFindPeer(server.arg("node").c_str(), &peer);
+
+  if (server.hasArg("mode")) {
+    const int next = server.arg("mode").toInt();
+    if (next >= 0 && next < MODE_COUNT) {
+      if (!forPeer) {
+        if (next != g_screenIndex) {
+          applyLocalMode(next);
+        }
+      } else if (peerOk && peer.mode != (uint8_t)next) {
+        meshSendSetMode(peer.mac, (uint8_t)next);
+      }
+    }
+  }
+
   uint8_t r = g_ledR;
   uint8_t g = g_ledG;
   uint8_t b = g_ledB;
   uint8_t bri = g_ledBri;
-
-  if (server.hasArg("mode")) {
-    const int next = server.arg("mode").toInt();
-    if (next >= 0 && next < MODE_COUNT && next != g_screenIndex) {
-      mode = next;
-      changed = true;
-    }
-  }
+  bool ledChanged = false;
   if (server.hasArg("led")) {
     uint8_t nr, ng, nb;
     if (parseColor(server.arg("led"), &nr, &ng, &nb) &&
@@ -852,39 +926,33 @@ static void handleControl() {
       r = nr;
       g = ng;
       b = nb;
-      changed = true;
+      ledChanged = true;
     }
   }
   if (server.hasArg("bri")) {
-    int next = server.arg("bri").toInt();
-    next = clampInt(next, 0, 100);
+    int next = clampInt(server.arg("bri").toInt(), 0, 100);
     if ((uint8_t)next != g_ledBri) {
       bri = (uint8_t)next;
-      changed = true;
+      ledChanged = true;
     }
   }
-  if (changed) {
-    applyShared(mode, r, g, b, bri, g_rev + 1, true);
+  if (ledChanged) {
+    applyLedMesh(r, g, b, bri, g_rev + 1, true);
   }
 
   if (server.hasArg("role")) {
     const String rs = server.arg("role");
-    if (rs == "conductor") {
-      g_claimGuardUntil = millis() + 3000;
-      if (g_role != ROLE_CONDUCTOR) {
-        g_role = ROLE_CONDUCTOR;
-        audioSetConductor(true);
-        saveSettings();
-        showWaiting();
+    const uint8_t want = rs == "conductor" ? ROLE_CONDUCTOR : ROLE_NODE;
+    if (rs == "conductor" || rs == "node") {
+      if (!forPeer) {
+        if (want == ROLE_CONDUCTOR) {
+          becomeConductor();
+        } else if (g_role != ROLE_NODE) {
+          becomeNode();
+        }
+      } else if (peerOk && peer.role != want) {
+        meshSendSetRole(peer.mac, want);
       }
-      publishIdentity(true);
-      meshSendClaim();
-    } else if (rs == "node" && g_role != ROLE_NODE) {
-      g_role = ROLE_NODE;
-      audioSetConductor(false);
-      g_vizDirty = true;
-      saveSettings();
-      publishIdentity(true);
     }
   }
 
@@ -898,7 +966,7 @@ static void handleControl() {
 }
 
 static void setupWebUi() {
-  server.on("/", HTTP_GET, []() { sendStatusPage(); });
+  server.on("/", HTTP_GET, []() { handleControl(); });
   server.on("/control", HTTP_GET, []() { handleControl(); });
 
   ElegantOTA.begin(&server, "ota", OTA_PASSWORD);
@@ -983,6 +1051,9 @@ static void publishViz() {
 }
 
 static void updateUi() {
+  if (!g_display) {
+    return;
+  }
   const uint32_t now = millis();
   if (g_showInfo) {
     if ((int32_t)(now - g_infoUntilMs) >= 0) {
@@ -1057,7 +1128,7 @@ void setup() {
   setupDisplay();
   connectWifi();
   publishIdentity(false);
-  meshBegin(onMeshConfig, onMeshClaim);
+  meshBegin(onMeshConfig, onMeshClaim, onMeshMode, onMeshRole);
   audioSetVizMode((uint8_t)g_screenIndex);
   audioBegin(g_role == ROLE_CONDUCTOR);
   setupArduinoOta();
@@ -1065,9 +1136,17 @@ void setup() {
   printBanner();
 
   applyLed();
-  g_showInfo = true;
-  g_infoUntilMs = millis() + kInfoOverlayMs;
-  drawInfoOverlay(WiFi.localIP().toString().c_str());
+#if MMM_PREFERRED_CONDUCTOR
+  if (g_role == ROLE_CONDUCTOR) {
+    g_claimGuardUntil = millis() + 3000;
+    meshSendClaim();
+  }
+#endif
+  if (g_display) {
+    g_showInfo = true;
+    g_infoUntilMs = millis() + kInfoOverlayMs;
+    drawInfoOverlay(WiFi.localIP().toString().c_str());
+  }
 }
 
 void loop() {
