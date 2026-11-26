@@ -1,7 +1,7 @@
-- OTA updater on both ESP32 Waveshare nodes (ArduinoOTA + ElegantOTA)
-- USB Audio Interface to DAC
-- USB Audio visualizations
+- [x] OTA updater on both ESP32 Waveshare nodes (ArduinoOTA + ElegantOTA) — tag 0.1.2
+- [ ] USB Audio Interface to DAC
+- [ ] USB Audio visualizations
     - FFT Spectrogram
     - Stereogram
     - Waveform spectrogram
-- Wireless visualizations from USB Audio to a connected node (also visualizing)
+- [ ] Wireless visualizations from USB Audio to a connected node (also visualizing)
