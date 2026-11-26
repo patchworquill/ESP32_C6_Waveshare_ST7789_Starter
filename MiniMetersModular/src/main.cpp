@@ -3,6 +3,7 @@
 #include <WebServer.h>
 #include <ArduinoOTA.h>
 #include <ElegantOTA.h>
+#include <FastLED.h>
 
 #include "LGFX_Waveshare_C6_147.hpp"
 #include "secrets.h"
@@ -17,16 +18,34 @@ static WebServer server(80);
 static LGFX tft;
 
 #define RGB_LED_PIN 8
+#define NUM_LEDS 1
+static CRGB leds[NUM_LEDS];
 
-// Idle identity color for this build (aqua)
-static const uint8_t kAquaR = 0;
-static const uint8_t kAquaG = 200;
-static const uint8_t kAquaB = 200;
+// Reddish-orange at ~10% of full scale (logical RGB)
+static const CRGB kIdleColor = CRGB(255, 69, 0);
+
+#define SMOOTHERSTEP(x) ((x) * (x) * (x) * ((x) * ((x) * 6 - 15) + 10))  // https://en.wikipedia.org/wiki/Smoothstep#Variations
+
+// Display backlight: default 30%, hard cap 50%
+static const uint8_t kDisplayBrightnessPercent = 30;
+static const uint8_t kDisplayBrightnessMaxPercent = 50;
 
 static char hostname[32];
 
-static void setLed(uint8_t r, uint8_t g, uint8_t b) {
-  neopixelWrite(RGB_LED_PIN, r, g, b);
+float inverse_smoothstep(float x) {               // https://en.wikipedia.org/wiki/Smoothstep#Variations
+  return 0.5 - sin(asin(1 - 2 * x) / 3);
+}
+
+static void setLed(const CRGB &color) {
+  leds[0] = color;
+  FastLED.show();
+}
+
+static uint8_t displayBrightnessByte(uint8_t percent) {
+  if (percent > kDisplayBrightnessMaxPercent) {
+    percent = kDisplayBrightnessMaxPercent;
+  }
+  return static_cast<uint8_t>((255 * percent) / 100);
 }
 
 static void buildHostname() {
@@ -79,7 +98,7 @@ static void drawStatusScreen(const char *wifiLine) {
   tft.setTextColor(TFT_CYAN);
   tft.setTextSize(1);
   tft.setCursor(8, 250);
-  tft.print("LED = aqua  GFX = Lovyan");
+  tft.print("LED = orange@10%  FastLED");
   tft.setCursor(8, 268);
   tft.print("OTA portal: /update");
 }
@@ -87,7 +106,7 @@ static void drawStatusScreen(const char *wifiLine) {
 static void setupDisplay() {
   tft.init();
   tft.setRotation(1);  // USB connector on the right
-  tft.setBrightness(230);
+  tft.setBrightness(displayBrightnessByte(kDisplayBrightnessPercent));
   drawStatusScreen("connecting...");
 }
 
@@ -101,9 +120,9 @@ static void connectWifi() {
   while (WiFi.status() != WL_CONNECTED) {
     delay(250);
     Serial.print('.');
-    setLed(kAquaR / 3, kAquaG / 3, kAquaB / 3);
+    setLed(kIdleColor);
     delay(50);
-    setLed(0, 0, 0);
+    setLed(CRGB::Black);
     if (millis() - started > 30000) {
       Serial.println("\nWiFi connect timeout — retrying");
       drawStatusScreen("wifi retry...");
@@ -124,19 +143,19 @@ static void setupArduinoOta() {
   ArduinoOTA.onStart([]() {
     const char *type = (ArduinoOTA.getCommand() == U_FLASH) ? "firmware" : "filesystem";
     Serial.printf("ArduinoOTA start (%s)\n", type);
-    setLed(255, 120, 0);
+    setLed(kIdleColor);
     drawStatusScreen("ArduinoOTA...");
   });
   ArduinoOTA.onEnd([]() {
     Serial.println("\nArduinoOTA end");
-    setLed(kAquaR, kAquaG, kAquaB);
+    setLed(kIdleColor);
   });
   ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
     Serial.printf("ArduinoOTA progress: %u%%\r", (progress * 100) / total);
   });
   ArduinoOTA.onError([](ota_error_t error) {
     Serial.printf("ArduinoOTA error[%u]\n", error);
-    setLed(255, 0, 0);
+    setLed(CRGB(25, 0, 0));
     drawStatusScreen("OTA error");
   });
 
@@ -162,12 +181,12 @@ static void setupElegantOta() {
   ElegantOTA.begin(&server, "ota", OTA_PASSWORD);
   ElegantOTA.onStart([]() {
     Serial.println("ElegantOTA start");
-    setLed(160, 0, 200);
+    setLed(kIdleColor);
     drawStatusScreen("ElegantOTA...");
   });
   ElegantOTA.onEnd([](bool success) {
     Serial.printf("ElegantOTA end success=%d\n", success);
-    setLed(success ? kAquaR : 255, success ? kAquaG : 0, success ? kAquaB : 0);
+    setLed(success ? kIdleColor : CRGB(25, 0, 0));
     if (!success) {
       drawStatusScreen("OTA failed");
     }
@@ -200,18 +219,18 @@ static void rgbHeartbeat() {
   }
   last = now;
   on = !on;
-  if (on) {
-    setLed(kAquaR, kAquaG, kAquaB);
-  } else {
-    setLed(0, 0, 0);
-  }
+  setLed(on ? kIdleColor : CRGB::Black);
 }
 
 void setup() {
   Serial.begin(115200);
   delay(800);
 
-  setLed(0, 0, 40);
+  // Waveshare C6 onboard LED is WS2812 with RGB wire order (GRB showed green-yellow for orange).
+  FastLED.addLeds<WS2812, RGB_LED_PIN, RGB>(leds, NUM_LEDS);
+  FastLED.setBrightness(10);
+  setLed(CRGB::Black);
+
   buildHostname();
   Serial.printf("Booting %s (%s)\n", hostname, kFirmwareVersion);
 
@@ -222,7 +241,7 @@ void setup() {
   printBanner();
 
   drawStatusScreen(WiFi.localIP().toString().c_str());
-  setLed(kAquaR, kAquaG, kAquaB);
+  setLed(kIdleColor);
 }
 
 void loop() {
