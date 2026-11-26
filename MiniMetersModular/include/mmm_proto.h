@@ -6,15 +6,16 @@
 // firmware and join the same Wi-Fi AP, so they are already on one channel.
 
 static const uint8_t kMeshMagic = 0xA5;
-static const uint8_t kMeshVer = 2;
+static const uint8_t kMeshVer = 4;
 
 enum MeshType : uint8_t {
   MESH_HELLO = 1,
-  MESH_CONFIG = 2,     // LED color and brightness, every node
+  MESH_CONFIG = 2,     // LED + theme, every node
   MESH_CLAIM = 3,      // sender is the conductor
   MESH_VIZ = 4,
   MESH_SET_MODE = 5,   // unicast: set this node's visualizer
   MESH_SET_ROLE = 6,   // unicast: set this node's role
+  MESH_SET_INPUT = 7,  // unicast: set this node's audio input
 };
 
 enum NodeRole : uint8_t {
@@ -28,7 +29,19 @@ enum VizMode : uint8_t {
   MODE_SPECTROGRAM = 2,
   MODE_WAVEFORM = 3,
   MODE_OSCILLOSCOPE = 4,
-  MODE_COUNT = 5,
+  MODE_OFF = 5,
+  MODE_COUNT = 6,
+};
+
+enum NodeCaps : uint8_t {
+  CAP_DISPLAY = 1 << 0,
+  CAP_USB_AUDIO = 1 << 1,
+};
+
+enum AudioInput : uint8_t {
+  INPUT_AUTO = 0,  // USB while the host is playing, otherwise UDP
+  INPUT_UDP = 1,
+  INPUT_USB = 2,
 };
 
 static const int kSpecBands = 32;
@@ -65,9 +78,12 @@ struct MeshHello {
   uint8_t led_g;
   uint8_t led_b;
   uint8_t led_bri;
+  uint8_t theme;
   uint32_t rev;
   uint8_t ip[4];
   char name[16];
+  uint8_t caps;
+  uint8_t input;
 };
 
 struct MeshConfig {
@@ -78,6 +94,7 @@ struct MeshConfig {
   uint8_t led_g;
   uint8_t led_b;
   uint8_t led_bri;
+  uint8_t theme;
   uint32_t rev;
 };
 
@@ -93,6 +110,13 @@ struct MeshSetRole {
   uint8_t ver;
   uint8_t type;
   uint8_t role;
+};
+
+struct MeshSetInput {
+  uint8_t magic;
+  uint8_t ver;
+  uint8_t type;
+  uint8_t input;
 };
 
 struct MeshClaim {

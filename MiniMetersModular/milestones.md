@@ -1,7 +1,9 @@
 - [x] OTA updater on both ESP32 Waveshare nodes (ArduinoOTA + ElegantOTA) — tag 0.1.2
-- [x] ESP-NOW mesh: viz mode is per node, LED color and brightness are shared (saved in NVS)
+- [x] ESP-NOW mesh: viz mode is per node, LED color/brightness and theme are shared (saved in NVS)
 - [x] Headless ESP32-S3 conductor target (UDP audio, display skipped)
 - [x] Conductor ingests 16 kHz PCM over UDP, runs FFT + K-weighted loudness, broadcasts viz frames
-- [ ] USB Audio Interface to DAC
-- [ ] USB Audio visualizations (local USB instead of UDP)
+- [ ] USB audio on the XIAO ESP32-S3 — parked, does not stream (see TODO.md). UDP remains the conductor input
+- [ ] I2S codec on the S3 (line in for the meters, DAC for monitor). TDM only if the codec is multi-channel
+- [ ] I2S path onward to a DAC on a display node
 - [ ] Thread transport for the audio fabric (802.15.4), once viz-over-ESP-NOW is not enough
+- Add a light sleep and deep sleep mode, ensuring that the ESPs can be woken from this to start streaming audio / displaying.

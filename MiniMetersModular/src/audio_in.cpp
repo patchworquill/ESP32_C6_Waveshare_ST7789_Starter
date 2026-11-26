@@ -1,4 +1,11 @@
+#include "mmm_log.h"
 #include "audio_in.h"
+
+#if MMM_USB_AUDIO
+#define USE_AUDIOTOOLS_NS false
+#define USE_AUDIO_LOGGING false
+#include "AudioTools/Communication/USB/USBAudioStream.h"
+#endif
 
 #include <WiFi.h>
 #include <WiFiUdp.h>
@@ -44,6 +51,13 @@ static WiFiUDP g_udp;
 static bool g_udpOn = false;
 static bool g_conductor = false;
 static uint8_t g_mode = MODE_SPECTRUM;
+static uint8_t g_input = INPUT_AUTO;
+
+#if MMM_USB_AUDIO
+static audio_tools::USBAudioStream g_usb;
+static bool g_usbOn = false;
+static char g_usbSerial[16];
+#endif
 
 static int16_t g_mono[kRing];
 static int16_t g_left[kRing];
@@ -75,7 +89,17 @@ static bool g_have = false;
 static uint32_t g_seq = 0;
 static uint32_t g_lastStep = 0;
 static uint32_t g_lastUdpMs = 0;
+static uint32_t g_lastUsbMs = 0;
+#if MMM_USB_AUDIO
+static const int kUsbRate = 48000;
+static const int kUsbDecim = kUsbRate / (int)kAudioRate;
+static int g_usbDecim = 0;
+static int32_t g_usbAccL = 0;
+static int32_t g_usbAccR = 0;
+static volatile uint32_t g_usbItfSets = 0;
+#endif
 static uint32_t g_packets = 0;
+static uint32_t g_usbPackets = 0;
 static bool g_wasLive = false;
 static uint32_t g_silenceSince = 0;
 static bool g_rateWarned = false;
@@ -432,11 +456,103 @@ static void resetAnalysis() {
   g_wasLive = false;
   g_silenceSince = 0;
   g_lastUdpMs = 0;
+  g_lastUsbMs = 0;
+#if MMM_USB_AUDIO
+  g_usbDecim = 0;
+  g_usbAccL = 0;
+  g_usbAccR = 0;
+#endif
   g_hp.reset();
   g_shelf.reset();
   memset(g_bandSmooth, 0, sizeof(g_bandSmooth));
   memset(g_blocks, 0, sizeof(g_blocks));
   g_have = false;
+}
+
+static bool sourceRecent(uint32_t stamp, uint32_t now) {
+  return stamp != 0 && (now - stamp) < 500;
+}
+
+static bool acceptSource(uint8_t which) {
+  if (g_input == which) {
+    return true;
+  }
+  if (g_input != INPUT_AUTO) {
+    return false;
+  }
+  if (which == INPUT_USB) {
+    return true;
+  }
+  return !sourceRecent(g_lastUsbMs, millis());
+}
+
+static void mirrorUsb(const uint8_t *data, size_t len) {
+#if MMM_USB_AUDIO
+  if (!g_usbOn || !data || len < 4 || !g_usb.isStreamingActiveTx()) {
+    return;
+  }
+  int space = g_usb.availableForWrite();
+  if (space < 4) {
+    return;
+  }
+  if ((size_t)space < len) {
+    len = (size_t)space;
+  }
+  len -= len % 4;
+  if (len >= 4) {
+    g_usb.write(data, len);
+  }
+#else
+  (void)data;
+  (void)len;
+#endif
+}
+
+static void drainUsb() {
+#if MMM_USB_AUDIO
+  if (!g_usbOn) {
+    return;
+  }
+  const bool take = acceptSource(INPUT_USB);
+  uint8_t buf[256];
+  for (int n = 0; n < 8; ++n) {
+    const int avail = g_usb.available();
+    if (avail < 4) {
+      return;
+    }
+    int want = avail;
+    if (want > (int)sizeof(buf)) {
+      want = (int)sizeof(buf);
+    }
+    want -= want % 4;
+    const size_t got = g_usb.readBytes(buf, (size_t)want);
+    if (got < 4) {
+      return;
+    }
+    const size_t frames = got - (got % 4);
+    if (!take) {
+      continue;
+    }
+    for (size_t i = 0; i < frames; i += 4) {
+      int16_t left = 0;
+      int16_t right = 0;
+      memcpy(&left, buf + i, 2);
+      memcpy(&right, buf + i + 2, 2);
+      g_usbAccL += left;
+      g_usbAccR += right;
+      if (++g_usbDecim < kUsbDecim) {
+        continue;
+      }
+      feedSample((int16_t)(g_usbAccL / kUsbDecim), (int16_t)(g_usbAccR / kUsbDecim));
+      g_usbAccL = 0;
+      g_usbAccR = 0;
+      g_usbDecim = 0;
+    }
+    mirrorUsb(buf, frames);
+    g_lastUsbMs = millis();
+    ++g_usbPackets;
+  }
+#endif
 }
 
 static void drainUdp() {
@@ -475,7 +591,10 @@ static void drainUdp() {
     if (n < need) {
       continue;
     }
+    const bool take = acceptSource(INPUT_UDP);
     const uint8_t *p = buf + sizeof(AudioHdr);
+    uint8_t mirror[256];
+    size_t mirrored = 0;
     for (uint16_t i = 0; i < hdr.count; ++i) {
       int16_t left = 0;
       int16_t right = 0;
@@ -487,16 +606,30 @@ static void drainUdp() {
       } else {
         right = left;
       }
+      if (!take) {
+        continue;
+      }
       feedSample(left, right);
+      if (mirrored + 4 > sizeof(mirror)) {
+        mirrorUsb(mirror, mirrored);
+        mirrored = 0;
+      }
+      memcpy(mirror + mirrored, &left, 2);
+      memcpy(mirror + mirrored + 2, &right, 2);
+      mirrored += 4;
     }
+    if (!take) {
+      continue;
+    }
+    mirrorUsb(mirror, mirrored);
     g_lastUdpMs = millis();
     ++g_packets;
   }
 }
 
 static void step(uint32_t now) {
-  const bool udpRecent = g_lastUdpMs != 0 && (now - g_lastUdpMs) < 500;
-  if (udpRecent && g_ringCount >= kFftN) {
+  const bool liveIn = sourceRecent(g_lastUdpMs, now) || sourceRecent(g_lastUsbMs, now);
+  if (liveIn && g_ringCount >= kFftN) {
     VizFrame frame;
     memset(&frame, 0, sizeof(frame));
     analyze(&frame);
@@ -533,6 +666,81 @@ void audioSetVizMode(uint8_t mode) {
   g_mode = mode;
 }
 
+void audioSetInput(uint8_t input) {
+  if (input > INPUT_USB) {
+    input = INPUT_AUTO;
+  }
+#if !MMM_USB_AUDIO
+  if (input == INPUT_USB) {
+    input = INPUT_UDP;
+  }
+#endif
+  g_input = input;
+}
+
+uint8_t audioInput() {
+  return g_input;
+}
+
+uint8_t audioHearing() {
+  const uint32_t now = millis();
+  const bool usb = sourceRecent(g_lastUsbMs, now);
+  const bool udp = sourceRecent(g_lastUdpMs, now);
+  if (usb && (g_input == INPUT_USB || g_input == INPUT_AUTO)) {
+    return INPUT_USB;
+  }
+  if (udp && (g_input == INPUT_UDP || g_input == INPUT_AUTO)) {
+    return INPUT_UDP;
+  }
+  return 255;
+}
+
+void usbAudioStart() {
+#if MMM_USB_AUDIO
+  uint16_t suffix = (uint16_t)(ESP.getEfuseMac() & 0xFFFF);
+  snprintf(g_usbSerial, sizeof(g_usbSerial), "mmm-%04x", suffix);
+
+  // Speaker only, adaptive, no feedback endpoint. 48 kHz is an exact
+  // number of samples per 1 ms frame, so the host does not need a clock
+  // pipe. Opening that pipe is what removes the device from the bus.
+  auto cfg = g_usb.defaultConfig(audio_tools::RX_MODE);
+  cfg.sample_rate = kUsbRate;
+  cfg.channels = 2;
+  cfg.bits_per_sample = 16;
+  cfg.manufacturer = "MiniMeters";
+  cfg.product = "MiniMeters";
+  cfg.serial = g_usbSerial;
+  cfg.vid = 0x303A;
+  cfg.pid = 0x4002;
+  cfg.begin_usb = false;
+  cfg.fifo_packets = 24;
+  cfg.rx_start_fill_percent = 0;
+  cfg.enable_feedback_ep = false;
+  cfg.self_powered = false;
+  cfg.max_power_ma = 250;
+  cfg.volume_active = false;
+  g_usb.setTudAudioSetItfCallback(
+      [](audio_tools::USBAudioDeviceBase*, uint8_t,
+         audio_tools::UsbSetupPacket const&) {
+        // The USB task must not write the CDC port. loop() prints this.
+        g_usbItfSets++;
+        return true;
+      });
+  if (!g_usb.begin(cfg)) {
+    Serial.println("usb audio begin failed");
+    return;
+  }
+  if (audio_tools::TinyUSBDevice.mounted()) {
+    audio_tools::TinyUSBDevice.detach();
+    delay(10);
+    audio_tools::TinyUSBDevice.attach();
+  }
+  g_usbOn = true;
+  Serial.printf("usb audio %d Hz speaker adaptive pkt=%u\n", kUsbRate,
+                g_usb.audioPacketSize());
+#endif
+}
+
 void audioSetConductor(bool conductor) {
   if (conductor == g_conductor && conductor == g_udpOn) {
     return;
@@ -562,9 +770,18 @@ void audioBegin(bool conductor) {
 }
 
 void audioPoll(uint32_t now) {
+#if MMM_USB_AUDIO
+  static uint32_t seenItf = 0;
+  const uint32_t sets = g_usbItfSets;
+  if (sets != seenItf) {
+    seenItf = sets;
+    Serial.printf("usb stream interface set %u\n", sets);
+  }
+#endif
   if (!g_conductor) {
     return;
   }
+  drainUsb();
   if (g_udpOn) {
     drainUdp();
   }
@@ -586,4 +803,8 @@ bool audioTake(VizFrame *out) {
 
 uint32_t audioPackets() {
   return g_packets;
+}
+
+uint32_t audioUsbPackets() {
+  return g_usbPackets;
 }

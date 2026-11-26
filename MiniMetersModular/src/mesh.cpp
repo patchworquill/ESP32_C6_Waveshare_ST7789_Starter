@@ -1,3 +1,4 @@
+#include "mmm_log.h"
 #include "mesh.h"
 
 #include <WiFi.h>
@@ -9,6 +10,7 @@ static_assert(sizeof(MeshHello) <= 250, "hello packet exceeds ESP-NOW");
 static_assert(sizeof(MeshConfig) <= 250, "config packet exceeds ESP-NOW");
 static_assert(sizeof(MeshSetMode) <= 250, "mode packet exceeds ESP-NOW");
 static_assert(sizeof(MeshSetRole) <= 250, "role packet exceeds ESP-NOW");
+static_assert(sizeof(MeshSetInput) <= 250, "input packet exceeds ESP-NOW");
 
 static const uint8_t kBcast[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
 static const uint32_t kPeerTimeoutMs = 5000;
@@ -32,7 +34,10 @@ struct Identity {
   char name[16];
   uint8_t role;
   uint8_t mode;
+  uint8_t caps;
+  uint8_t input;
   uint8_t r, g, b, bri;
+  uint8_t theme;
   uint32_t rev;
 };
 
@@ -43,6 +48,7 @@ static MeshConfigFn g_onConfig = nullptr;
 static MeshClaimFn g_onClaim = nullptr;
 static MeshModeFn g_onMode = nullptr;
 static MeshRoleFn g_onRole = nullptr;
+static MeshInputFn g_onInput = nullptr;
 static uint8_t g_directMac[6];
 static uint8_t g_directData[8];
 static uint8_t g_directLen = 0;
@@ -118,7 +124,7 @@ static void ensurePeer(const uint8_t mac[6]) {
   }
 }
 
-static void notePeer(const uint8_t mac[6], int mode, int role) {
+static void notePeer(const uint8_t mac[6], int mode, int role, int input) {
   for (int i = 0; i < kMaxPeers; ++i) {
     if (!g_peers[i].used || memcmp(g_peers[i].mac, mac, 6) != 0) {
       continue;
@@ -128,6 +134,9 @@ static void notePeer(const uint8_t mac[6], int mode, int role) {
     }
     if (role >= 0) {
       g_peers[i].info.role = (uint8_t)role;
+    }
+    if (input >= 0) {
+      g_peers[i].info.input = (uint8_t)input;
     }
   }
 }
@@ -200,10 +209,13 @@ static bool sendHello() {
   fillHeader(&pkt.magic, &pkt.ver, &pkt.type, MESH_HELLO);
   pkt.role = g_id.role;
   pkt.mode = g_id.mode;
+  pkt.caps = g_id.caps;
+  pkt.input = g_id.input;
   pkt.led_r = g_id.r;
   pkt.led_g = g_id.g;
   pkt.led_b = g_id.b;
   pkt.led_bri = g_id.bri;
+  pkt.theme = g_id.theme;
   pkt.rev = g_id.rev;
   IPAddress ip = WiFi.localIP();
   pkt.ip[0] = ip[0];
@@ -222,6 +234,7 @@ static bool sendConfigNow() {
   pkt.led_g = g_id.g;
   pkt.led_b = g_id.b;
   pkt.led_bri = g_id.bri;
+  pkt.theme = g_id.theme;
   pkt.rev = g_id.rev;
   return sendRaw(reinterpret_cast<uint8_t *>(&pkt), sizeof(pkt));
 }
@@ -254,6 +267,8 @@ static void handlePacket(const RxItem &item) {
     memcpy(slot->info.mac, item.mac, 6);
     slot->info.role = hello.role;
     slot->info.mode = hello.mode;
+    slot->info.caps = hello.caps;
+    slot->info.input = hello.input;
     memcpy(slot->info.ip, hello.ip, 4);
     slot->info.rssi = item.rssi;
     memset(slot->info.name, 0, sizeof(slot->info.name));
@@ -268,7 +283,7 @@ static void handlePacket(const RxItem &item) {
     }
     ensurePeer(item.mac);
     if (g_onConfig) {
-      g_onConfig(hello.led_r, hello.led_g, hello.led_b, hello.led_bri, hello.rev);
+      g_onConfig(hello.led_r, hello.led_g, hello.led_b, hello.led_bri, hello.theme, hello.rev);
     }
     return;
   }
@@ -277,7 +292,7 @@ static void handlePacket(const RxItem &item) {
     MeshConfig cfg;
     memcpy(&cfg, item.data, sizeof(cfg));
     if (g_onConfig) {
-      g_onConfig(cfg.led_r, cfg.led_g, cfg.led_b, cfg.led_bri, cfg.rev);
+      g_onConfig(cfg.led_r, cfg.led_g, cfg.led_b, cfg.led_bri, cfg.theme, cfg.rev);
     }
     return;
   }
@@ -296,6 +311,15 @@ static void handlePacket(const RxItem &item) {
     memcpy(&pkt, item.data, sizeof(pkt));
     if (g_onRole) {
       g_onRole(pkt.role);
+    }
+    return;
+  }
+
+  if (type == MESH_SET_INPUT && item.len >= sizeof(MeshSetInput)) {
+    MeshSetInput pkt;
+    memcpy(&pkt, item.data, sizeof(pkt));
+    if (pkt.input <= INPUT_USB && g_onInput) {
+      g_onInput(pkt.input);
     }
     return;
   }
@@ -326,26 +350,31 @@ static void handlePacket(const RxItem &item) {
   }
 }
 
-void meshSetIdentity(const char *name, uint8_t role, uint8_t mode, uint8_t r, uint8_t g, uint8_t b,
-                     uint8_t bri, uint32_t rev) {
+void meshSetIdentity(const char *name, uint8_t role, uint8_t mode, uint8_t caps, uint8_t input,
+                     uint8_t r, uint8_t g, uint8_t b, uint8_t bri, uint8_t theme, uint32_t rev) {
   memset(g_id.name, 0, sizeof(g_id.name));
   if (name) {
     strncpy(g_id.name, name, sizeof(g_id.name) - 1);
   }
   g_id.role = role;
   g_id.mode = mode;
+  g_id.caps = caps;
+  g_id.input = input;
   g_id.r = r;
   g_id.g = g;
   g_id.b = b;
   g_id.bri = bri;
+  g_id.theme = theme;
   g_id.rev = rev;
 }
 
-void meshBegin(MeshConfigFn onConfig, MeshClaimFn onClaim, MeshModeFn onMode, MeshRoleFn onRole) {
+void meshBegin(MeshConfigFn onConfig, MeshClaimFn onClaim, MeshModeFn onMode, MeshRoleFn onRole,
+               MeshInputFn onInput) {
   g_onConfig = onConfig;
   g_onClaim = onClaim;
   g_onMode = onMode;
   g_onRole = onRole;
+  g_onInput = onInput;
   g_rxQueue = xQueueCreate(8, sizeof(RxItem));
   if (!g_rxQueue) {
     Serial.println("esp-now queue failed");
@@ -447,7 +476,7 @@ void meshSendSetMode(const uint8_t mac[6], uint8_t mode) {
   fillHeader(&pkt.magic, &pkt.ver, &pkt.type, MESH_SET_MODE);
   pkt.mode = mode;
   queueDirect(mac, &pkt, sizeof(pkt));
-  notePeer(mac, mode, -1);
+  notePeer(mac, mode, -1, -1);
 }
 
 void meshSendSetRole(const uint8_t mac[6], uint8_t role) {
@@ -456,7 +485,16 @@ void meshSendSetRole(const uint8_t mac[6], uint8_t role) {
   fillHeader(&pkt.magic, &pkt.ver, &pkt.type, MESH_SET_ROLE);
   pkt.role = role;
   queueDirect(mac, &pkt, sizeof(pkt));
-  notePeer(mac, -1, role);
+  notePeer(mac, -1, role, -1);
+}
+
+void meshSendSetInput(const uint8_t mac[6], uint8_t input) {
+  MeshSetInput pkt;
+  memset(&pkt, 0, sizeof(pkt));
+  fillHeader(&pkt.magic, &pkt.ver, &pkt.type, MESH_SET_INPUT);
+  pkt.input = input;
+  queueDirect(mac, &pkt, sizeof(pkt));
+  notePeer(mac, -1, -1, input);
 }
 
 bool meshFindPeer(const char *name, MeshPeerInfo *out) {

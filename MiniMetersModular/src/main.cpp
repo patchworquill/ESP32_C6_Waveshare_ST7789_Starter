@@ -1,7 +1,10 @@
-#include <Arduino.h>
+#include "mmm_log.h"
+
 #include <ArduinoOTA.h>
 #include <ElegantOTA.h>
+#if !defined(MMM_LED_RGB) || MMM_LED_RGB
 #include <FastLED.h>
+#endif
 #include <Preferences.h>
 #include <WebServer.h>
 #include <WiFi.h>
@@ -12,6 +15,7 @@
 #include "mesh.h"
 #include "mmm_proto.h"
 #include "secrets.h"
+#include "themes_data.h"
 
 #ifndef FIRMWARE_VERSION
 #define FIRMWARE_VERSION "0.0.0-dev"
@@ -35,10 +39,22 @@ static Preferences prefs;
 #ifndef MMM_PREFERRED_CONDUCTOR
 #define MMM_PREFERRED_CONDUCTOR 0
 #endif
+#ifndef MMM_LED_RGB
+#define MMM_LED_RGB 1
+#endif
+#ifndef MMM_LED_ACTIVE_LOW
+#define MMM_LED_ACTIVE_LOW 0
+#endif
 
+#if MMM_USB_AUDIO
+USBCDC USBSerial;
+#endif
+
+#if MMM_LED_RGB
 #define RGB_LED_PIN MMM_LED_PIN
 #define NUM_LEDS 1
 static CRGB leds[NUM_LEDS];
+#endif
 static bool g_display = false;
 
 // Display backlight stays at a fixed modest level. The web control is the
@@ -72,15 +88,18 @@ static const char *kModeNames[MODE_COUNT] = {
     "Spectrogram",
     "Waveform",
     "Oscilloscope",
+    "Off",
 };
 
 static char hostname[32];
 static int g_screenIndex = MODE_SPECTRUM;
 static uint8_t g_role = ROLE_NODE;
+static uint8_t g_input = INPUT_AUTO;
 static uint8_t g_ledR = 255;
 static uint8_t g_ledG = 69;
 static uint8_t g_ledB = 0;
 static uint8_t g_ledBri = 4;
+static uint8_t g_theme = kThemeDefault;
 static uint32_t g_rev = 0;
 static uint32_t g_claimGuardUntil = 0;
 
@@ -117,16 +136,53 @@ static int clampInt(int v, int lo, int hi) {
   return v;
 }
 
+static int isqrt(int v) {
+  if (v <= 0) {
+    return 0;
+  }
+  int x = v;
+  int y = (x + 1) / 2;
+  while (y < x) {
+    x = y;
+    y = (x + v / x) / 2;
+  }
+  return x;
+}
+
 static void applyLed() {
+#if MMM_LED_RGB
   const uint8_t scale = (uint8_t)((g_ledBri * 255) / 100);
   FastLED.setBrightness(scale);
   leds[0] = CRGB(g_ledR, g_ledG, g_ledB);
   FastLED.show();
+#else
+  // One LED. Stretch the low end so the shared 4% RGB brightness is still a
+  // visible glow, and fold in the color so a hue change moves the level.
+  const int luma = ((int)g_ledR * 77 + (int)g_ledG * 150 + (int)g_ledB * 29) >> 8;
+  int lin = (luma * (int)g_ledBri) / 100;
+  int level = isqrt(lin * 255);
+  if (level > 255) {
+    level = 255;
+  }
+#if MMM_LED_ACTIVE_LOW
+  level = 255 - level;
+#endif
+  ledcWrite(MMM_LED_PIN, level);
+#endif
 }
 
-static void setLedRaw(const CRGB &color) {
-  leds[0] = color;
+static void setLedRaw(uint8_t r, uint8_t g, uint8_t b) {
+#if MMM_LED_RGB
+  leds[0] = CRGB(r, g, b);
   FastLED.show();
+#else
+  const int luma = ((int)r * 77 + (int)g * 150 + (int)b * 29) >> 8;
+#if MMM_LED_ACTIVE_LOW
+  ledcWrite(MMM_LED_PIN, 255 - luma);
+#else
+  ledcWrite(MMM_LED_PIN, luma);
+#endif
+#endif
 }
 
 static uint8_t displayBrightnessByte(uint8_t percent) {
@@ -142,12 +198,30 @@ static void buildHostname() {
   snprintf(hostname, sizeof(hostname), "mmm-%04x", suffix);
 }
 
-static void initPalette() {
-  colBg = tft.color565(0, 0, 0);
-  colBgAccent = tft.color565(43, 48, 55);
-  colPrimary = tft.color565(172, 192, 222);
-  colText = tft.color565(255, 255, 255);
-  colMuted = tft.color565(86, 96, 111);
+static uint8_t clampTheme(uint8_t index) {
+  return index < kThemeCount ? index : kThemeDefault;
+}
+
+static const ThemeDef &currentTheme() {
+  return kThemes[clampTheme(g_theme)];
+}
+
+static uint16_t themeColor(const ThemeRgb &c) {
+  return (uint16_t)(((c.r & 0xF8) << 8) | ((c.g & 0xFC) << 3) | (c.b >> 3));
+}
+
+static void applyPalette() {
+  const ThemeDef &theme = currentTheme();
+  colBg = themeColor(theme.background);
+  colBgAccent = themeColor(theme.background_secondary);
+  colMuted = themeColor(theme.secondary);
+  colText = themeColor(theme.text);
+  ThemeRgb primary = theme.primary;
+  if (g_screenIndex >= 0 && g_screenIndex <= MODE_OSCILLOSCOPE &&
+      (theme.mode_primary_mask & (1u << g_screenIndex))) {
+    primary = theme.mode_primary[g_screenIndex];
+  }
+  colPrimary = themeColor(primary);
 }
 
 static void useMonoFont() {
@@ -167,9 +241,20 @@ static const char *roleName(uint8_t role) {
   return role == ROLE_CONDUCTOR ? "conductor" : "node";
 }
 
+static uint8_t localCaps() {
+  uint8_t caps = 0;
+#if !MMM_HEADLESS
+  caps |= CAP_DISPLAY;
+#endif
+#if MMM_USB_AUDIO
+  caps |= CAP_USB_AUDIO;
+#endif
+  return caps;
+}
+
 static void publishIdentity(bool announce) {
-  meshSetIdentity(hostname, g_role, (uint8_t)g_screenIndex, g_ledR, g_ledG, g_ledB, g_ledBri,
-                  g_rev);
+  meshSetIdentity(hostname, g_role, (uint8_t)g_screenIndex, localCaps(), g_input, g_ledR, g_ledG,
+                  g_ledB, g_ledBri, g_theme, g_rev);
   if (announce) {
     meshAnnounce();
   }
@@ -185,7 +270,9 @@ static void saveSettings() {
   prefs.putUChar("led_g", g_ledG);
   prefs.putUChar("led_b", g_ledB);
   prefs.putUChar("led_bri", g_ledBri);
+  prefs.putUChar("theme", g_theme);
   prefs.putUChar("role", g_role);
+  prefs.putUChar("ain", g_input);
   prefs.putUInt("rev", g_rev);
   prefs.end();
 }
@@ -199,7 +286,9 @@ static void loadSettings() {
   g_ledG = prefs.getUChar("led_g", 69);
   g_ledB = prefs.getUChar("led_b", 0);
   g_ledBri = prefs.getUChar("led_bri", 4);
+  g_theme = prefs.getUChar("theme", kThemeDefault);
   g_role = prefs.getUChar("role", MMM_DEFAULT_ROLE);
+  g_input = prefs.getUChar("ain", INPUT_AUTO);
   g_rev = prefs.getUInt("rev", 0);
   prefs.end();
   if (g_screenIndex < 0 || g_screenIndex >= MODE_COUNT) {
@@ -211,6 +300,15 @@ static void loadSettings() {
   if (g_ledBri > 100) {
     g_ledBri = 100;
   }
+  g_theme = clampTheme(g_theme);
+  if (g_input > INPUT_USB) {
+    g_input = INPUT_AUTO;
+  }
+#if !MMM_USB_AUDIO
+  if (g_input == INPUT_USB) {
+    g_input = INPUT_UDP;
+  }
+#endif
 }
 
 static void setScreen(int index) {
@@ -219,6 +317,7 @@ static void setScreen(int index) {
     return;
   }
   g_screenIndex = index;
+  applyPalette();
   g_vizDirty = true;
   audioSetVizMode((uint8_t)g_screenIndex);
 }
@@ -235,13 +334,21 @@ static void applyLocalMode(int mode) {
   publishIdentity(true);
 }
 
-static void applyLedMesh(uint8_t r, uint8_t g, uint8_t b, uint8_t bri, uint32_t rev, bool broadcast) {
+static void applySharedConfig(uint8_t r, uint8_t g, uint8_t b, uint8_t bri, uint8_t theme,
+                              uint32_t rev, bool broadcast) {
+  const uint8_t nextTheme = clampTheme(theme);
+  const bool themeChanged = nextTheme != g_theme;
   g_ledR = r;
   g_ledG = g;
   g_ledB = b;
   g_ledBri = bri;
+  g_theme = nextTheme;
   g_rev = rev;
   applyLed();
+  if (themeChanged) {
+    applyPalette();
+    g_vizDirty = true;
+  }
   saveSettings();
   publishIdentity(broadcast);
   if (broadcast) {
@@ -249,20 +356,51 @@ static void applyLedMesh(uint8_t r, uint8_t g, uint8_t b, uint8_t bri, uint32_t 
   }
 }
 
-static void onMeshConfig(uint8_t r, uint8_t g, uint8_t b, uint8_t bri, uint32_t rev) {
+static void onMeshConfig(uint8_t r, uint8_t g, uint8_t b, uint8_t bri, uint8_t theme, uint32_t rev) {
   if (rev <= g_rev) {
     return;
   }
-  Serial.printf("mesh led rev=%u rgb=%u,%u,%u bri=%u\n", rev, r, g, b, bri);
-  applyLedMesh(r, g, b, bri, rev, false);
+  Serial.printf("mesh cfg rev=%u rgb=%u,%u,%u bri=%u theme=%u\n", rev, r, g, b, bri, theme);
+  applySharedConfig(r, g, b, bri, theme, rev, false);
+}
+
+static bool hasDisplay() {
+#if MMM_HEADLESS
+  return false;
+#else
+  return true;
+#endif
+}
+
+static void applyInput(uint8_t input) {
+  if (input > INPUT_USB) {
+    return;
+  }
+#if !MMM_USB_AUDIO
+  if (input == INPUT_USB) {
+    return;
+  }
+#endif
+  if (g_input == input) {
+    return;
+  }
+  g_input = input;
+  audioSetInput(input);
+  saveSettings();
+  publishIdentity(true);
 }
 
 static void onMeshMode(uint8_t mode) {
-  if (mode >= MODE_COUNT) {
+  if (!hasDisplay() || mode >= MODE_COUNT) {
     return;
   }
   Serial.printf("mesh set viz %s\n", modeName(mode));
   applyLocalMode(mode);
+}
+
+static void onMeshInput(uint8_t input) {
+  Serial.printf("mesh set input %u\n", input);
+  applyInput(input);
 }
 
 static void becomeConductor() {
@@ -620,7 +758,7 @@ static void setupDisplay() {
   tft.init();
   tft.setRotation(1);
   tft.setBrightness(displayBrightnessByte(kDisplayBrightnessPercent));
-  initPalette();
+  applyPalette();
   g_display = true;
   drawBootConnecting("wifi...");
 #endif
@@ -639,7 +777,7 @@ static void connectWifi() {
     Serial.print('.');
     applyLed();
     delay(40);
-    setLedRaw(CRGB::Black);
+    setLedRaw(0, 0, 0);
     if (millis() - started > 30000) {
       Serial.println("\nWiFi connect timeout, retrying");
       drawBootConnecting("wifi retry...");
@@ -676,7 +814,7 @@ static void setupArduinoOta() {
   });
   ArduinoOTA.onError([](ota_error_t error) {
     Serial.printf("ArduinoOTA error[%u]\n", error);
-    setLedRaw(CRGB(80, 0, 0));
+    setLedRaw(80, 0, 0);
     drawInfoOverlay("OTA error");
   });
 
@@ -706,8 +844,40 @@ static void sendNoStore() {
   server.sendHeader("Cache-Control", "no-store");
 }
 
+static const char *inputName(uint8_t input) {
+  if (input == INPUT_UDP) {
+    return "UDP";
+  }
+  if (input == INPUT_USB) {
+    return "USB";
+  }
+  return "Auto";
+}
+
+static void appendInputPill(String &body, const char *name, const char *label, const char *src,
+                            bool active, bool enabled) {
+  if (!enabled) {
+    body += F("<span class=\"pill dim\">");
+    body += label;
+    body += F("</span>");
+    return;
+  }
+  body += F("<a class=\"pill");
+  if (active) {
+    body += F(" active");
+  }
+  body += F("\" href=\"/control?node=");
+  body += htmlEscape(name);
+  body += F("&src=");
+  body += src;
+  body += F("\">");
+  body += label;
+  body += F("</a>");
+}
+
 static void appendNodeCard(String &body, const char *name, bool self, uint8_t role, uint8_t mode,
-                           const char *ip, int rssi, bool showRssi) {
+                           uint8_t caps, uint8_t input, uint8_t hearing, const char *ip, int rssi,
+                           bool showRssi) {
   body += F("<article class=\"card");
   if (self) {
     body += F(" self");
@@ -729,7 +899,11 @@ static void appendNodeCard(String &body, const char *name, bool self, uint8_t ro
   body += F("<br>");
   body += roleName(role);
   body += F(" · ");
-  body += htmlEscape(modeName(mode));
+  if (caps & CAP_DISPLAY) {
+    body += htmlEscape(modeName(mode));
+  } else {
+    body += F("no display");
+  }
   if (self) {
     body += F("<br>");
     body += meshReady() ? "esp-now" : "esp-now offline";
@@ -762,8 +936,19 @@ static void appendNodeCard(String &body, const char *name, bool self, uint8_t ro
   body += htmlEscape(name);
   body += F("&role=node\">Node</a></p>");
 
-  body += F("<p class=k>viz</p><p class=pills>");
+  const bool display = caps & CAP_DISPLAY;
+  body += F("<p class=k>viz</p><p class=\"pills");
+  if (!display) {
+    body += F(" dim");
+  }
+  body += F("\">");
   for (int i = 0; i < MODE_COUNT; ++i) {
+    if (!display) {
+      body += F("<span class=\"pill dim\">");
+      body += htmlEscape(kModeNames[i]);
+      body += F("</span>");
+      continue;
+    }
     body += F("<a class=\"pill");
     if (i == (int)mode) {
       body += F(" active");
@@ -777,8 +962,28 @@ static void appendNodeCard(String &body, const char *name, bool self, uint8_t ro
     body += F("</a>");
   }
   body += F("</p>");
+  if (!display) {
+    body += F("<p class=muted>no display on this node</p>");
+  }
 
   if (role == ROLE_CONDUCTOR && ip[0]) {
+    const bool usb = caps & CAP_USB_AUDIO;
+    body += F("<p class=k>audio in</p><p class=pills>");
+    appendInputPill(body, name, "Auto", "auto", input == INPUT_AUTO, true);
+    appendInputPill(body, name, "UDP", "udp", input == INPUT_UDP, true);
+    appendInputPill(body, name, "USB", "usb", input == INPUT_USB, usb);
+    body += F("</p>");
+    if (self) {
+      body += F("<p class=muted>hearing ");
+      if (hearing == INPUT_USB) {
+        body += F("usb");
+      } else if (hearing == INPUT_UDP) {
+        body += F("udp");
+      } else {
+        body += F("silence");
+      }
+      body += F("</p>");
+    }
     body += F("<p class=k>stream</p><p class=v>udp://");
     body += htmlEscape(ip);
     body += F(":");
@@ -786,6 +991,9 @@ static void appendNodeCard(String &body, const char *name, bool self, uint8_t ro
     body += F("</p><p class=muted>python stream_audio.py ");
     body += htmlEscape(ip);
     body += F("</p>");
+    if (usb) {
+      body += F("<p class=muted>USB speaker in, 48 kHz stereo. Select MiniMeters in Sound settings.</p>");
+    }
   }
 
   if (ip[0]) {
@@ -804,7 +1012,7 @@ static void sendControlPage() {
   snprintf(color, sizeof(color), "#%02x%02x%02x", g_ledR, g_ledG, g_ledB);
 
   String body;
-  body.reserve(8192);
+  body.reserve(16384);
   body += F("<!doctype html><html><head><meta charset=utf-8>");
   body += F("<meta name=viewport content=\"width=device-width,initial-scale=1\">");
   body += F("<title>MiniMeters Modular</title><style>");
@@ -821,6 +1029,7 @@ static void sendControlPage() {
   body += F(".pills{display:flex;flex-wrap:wrap;gap:.35rem;margin:0}");
   body += F(".pill{border:1px solid #56606F;color:#ACC0DE;padding:.3rem .5rem;font-size:12px}");
   body += F(".pill.active{background:#2B3037;border-color:#ACC0DE;color:#fff}");
+  body += F(".pill.dim,.pills.dim{color:#3a414c;border-color:#2B3037;pointer-events:none}");
   body += F(".links{margin:1rem 0 0}.links a{margin-right:1rem}");
   body += F(".tip{position:relative;color:#56606F;font-size:11px;cursor:help;border-bottom:1px dotted #56606F}");
   body += F(".tipbox{display:none;position:absolute;z-index:2;right:0;top:1.3rem;background:#2B3037;color:#fff;");
@@ -833,10 +1042,11 @@ static void sendControlPage() {
   body += F(".ver{color:#56606F;font-size:11px;margin-top:2rem}");
   body += F("</style></head><body>");
   body += F("<h1>MiniMeters Modular</h1>");
-  body += F("<p class=muted>Each node keeps its own visualizer. LED color and brightness apply to every node.</p>");
+  body += F("<p class=muted>Each node keeps its own visualizer. Theme, LED color, and brightness apply to every node.</p>");
 
   body += F("<div class=cards>");
-  appendNodeCard(body, hostname, true, g_role, (uint8_t)g_screenIndex, ip.c_str(), 0, false);
+  appendNodeCard(body, hostname, true, g_role, (uint8_t)g_screenIndex, localCaps(), g_input,
+                 audioHearing(), ip.c_str(), 0, false);
   MeshPeerInfo peers[8];
   const int n = meshCopyPeers(peers, 8);
   for (int i = 0; i < n; ++i) {
@@ -844,11 +1054,27 @@ static void sendControlPage() {
     snprintf(ipbuf, sizeof(ipbuf), "%u.%u.%u.%u", peers[i].ip[0], peers[i].ip[1], peers[i].ip[2],
              peers[i].ip[3]);
     const char *peerName = peers[i].name[0] ? peers[i].name : "peer";
-    appendNodeCard(body, peerName, false, peers[i].role, peers[i].mode, ipbuf, peers[i].rssi, true);
+    appendNodeCard(body, peerName, false, peers[i].role, peers[i].mode, peers[i].caps,
+                   peers[i].input, 255, ipbuf, peers[i].rssi, true);
   }
   body += F("</div>");
 
-  body += F("<form class=led action=/control method=get>");
+  body += F("<div class=led>");
+  body += F("<p class=k>theme, all nodes</p><p class=pills>");
+  for (uint8_t i = 0; i < kThemeCount; ++i) {
+    body += F("<a class=\"pill");
+    if (i == g_theme) {
+      body += F(" active");
+    }
+    body += F("\" href=\"/control?theme=");
+    body += String(i);
+    body += F("\">");
+    body += htmlEscape(kThemes[i].name);
+    body += F("</a>");
+  }
+  body += F("</p>");
+
+  body += F("<form action=/control method=get>");
   body += F("<p class=k>led, all nodes</p>");
   body += F("<p><input type=color name=led value=\"");
   body += color;
@@ -858,10 +1084,16 @@ static void sendControlPage() {
   body += F("<p><input id=bri type=range name=bri min=0 max=100 value=\"");
   body += String(g_ledBri);
   body += F("\"> <button type=submit>Apply LED</button></p></form>");
+#if !MMM_LED_RGB
+  body += F("<p class=muted>This board's user LED is a single color and follows brightness. The red LED by the USB port is the charger and stays on.</p>");
+#endif
+  body += F("</div>");
   body += F("<script>var b=document.getElementById('bri'),o=document.getElementById('bv');");
   body += F("if(b&&o)b.oninput=function(){o.textContent=b.value}</script>");
   body += F("<p class=ver>firmware ");
   body += htmlEscape(kFirmwareVersion);
+  body += F(" · ");
+  body += htmlEscape(currentTheme().name);
   body += F("</p></body></html>");
   sendNoStore();
   server.send(200, "text/html", body);
@@ -903,13 +1135,34 @@ static void handleControl() {
 
   if (server.hasArg("mode")) {
     const int next = server.arg("mode").toInt();
+    const bool peerDisplay = peerOk && (peer.caps & CAP_DISPLAY);
     if (next >= 0 && next < MODE_COUNT) {
       if (!forPeer) {
-        if (next != g_screenIndex) {
+        if (hasDisplay() && next != g_screenIndex) {
           applyLocalMode(next);
         }
-      } else if (peerOk && peer.mode != (uint8_t)next) {
+      } else if (peerDisplay && peer.mode != (uint8_t)next) {
         meshSendSetMode(peer.mac, (uint8_t)next);
+      }
+    }
+  }
+
+  if (server.hasArg("src")) {
+    const String src = server.arg("src");
+    uint8_t want = 255;
+    if (src == "auto") {
+      want = INPUT_AUTO;
+    } else if (src == "udp") {
+      want = INPUT_UDP;
+    } else if (src == "usb") {
+      want = INPUT_USB;
+    }
+    if (want != 255) {
+      if (!forPeer) {
+        applyInput(want);
+      } else if (peerOk && peer.input != want &&
+                 (want != INPUT_USB || (peer.caps & CAP_USB_AUDIO))) {
+        meshSendSetInput(peer.mac, want);
       }
     }
   }
@@ -918,7 +1171,15 @@ static void handleControl() {
   uint8_t g = g_ledG;
   uint8_t b = g_ledB;
   uint8_t bri = g_ledBri;
-  bool ledChanged = false;
+  uint8_t theme = g_theme;
+  bool sharedChanged = false;
+  if (server.hasArg("theme")) {
+    const int next = server.arg("theme").toInt();
+    if (next >= 0 && next < (int)kThemeCount && (uint8_t)next != g_theme) {
+      theme = (uint8_t)next;
+      sharedChanged = true;
+    }
+  }
   if (server.hasArg("led")) {
     uint8_t nr, ng, nb;
     if (parseColor(server.arg("led"), &nr, &ng, &nb) &&
@@ -926,18 +1187,18 @@ static void handleControl() {
       r = nr;
       g = ng;
       b = nb;
-      ledChanged = true;
+      sharedChanged = true;
     }
   }
   if (server.hasArg("bri")) {
     int next = clampInt(server.arg("bri").toInt(), 0, 100);
     if ((uint8_t)next != g_ledBri) {
       bri = (uint8_t)next;
-      ledChanged = true;
+      sharedChanged = true;
     }
   }
-  if (ledChanged) {
-    applyLedMesh(r, g, b, bri, g_rev + 1, true);
+  if (sharedChanged) {
+    applySharedConfig(r, g, b, bri, theme, g_rev + 1, true);
   }
 
   if (server.hasArg("role")) {
@@ -957,7 +1218,7 @@ static void handleControl() {
   }
 
   const bool requested = server.hasArg("mode") || server.hasArg("led") || server.hasArg("bri") ||
-                        server.hasArg("role");
+                        server.hasArg("theme") || server.hasArg("role") || server.hasArg("src");
   if (requested) {
     redirectControl();
     return;
@@ -980,7 +1241,7 @@ static void setupWebUi() {
   ElegantOTA.onEnd([](bool success) {
     Serial.printf("ElegantOTA end success=%d\n", success);
     if (!success) {
-      setLedRaw(CRGB(80, 0, 0));
+      setLedRaw(80, 0, 0);
       g_showInfo = true;
       g_infoUntilMs = millis() + 5000;
       drawInfoOverlay("OTA failed");
@@ -1005,30 +1266,54 @@ static void printBanner() {
   Serial.printf(" channel : %d\n", WiFi.channel());
   Serial.printf(" role    : %s\n", roleName(g_role));
   Serial.printf(" viz     : %s\n", modeName(g_screenIndex));
+  Serial.printf(" theme   : %s\n", currentTheme().name);
   Serial.printf(" esp-now : %s\n", meshReady() ? "up" : "off");
   if (g_role == ROLE_CONDUCTOR) {
     Serial.printf(" audio   : udp://%s:%u\n", WiFi.localIP().toString().c_str(), kAudioUdpPort);
+#if MMM_USB_AUDIO
+    Serial.println(" usb     : speaker 48000 Hz adaptive");
+#endif
   }
+#if MMM_HEADLESS
+  Serial.println(" display : none");
+#else
   Serial.println(" display : LovyanGFX / ST7789 172x320");
+#endif
   Serial.printf(" control : http://%s/control\n", WiFi.localIP().toString().c_str());
   Serial.printf(" ElegantOTA: http://%s/update  user=ota\n", WiFi.localIP().toString().c_str());
   Serial.println("========================================");
 }
 
+static const char *hearingName(uint8_t hearing) {
+  if (hearing == INPUT_USB) {
+    return "usb";
+  }
+  if (hearing == INPUT_UDP) {
+    return "udp";
+  }
+  return "silence";
+}
+
 static void logLink() {
   static uint32_t last = 0;
-  static uint32_t prevPkts = 0;
+  static uint32_t prevUdp = 0;
+  static uint32_t prevUsb = 0;
   const uint32_t now = millis();
   if (now - last < 3000) {
     return;
   }
-  const uint32_t pkts = audioPackets();
+  const uint32_t udp = audioPackets();
+  const uint32_t usb = audioUsbPackets();
   const uint32_t dt = now - last;
-  const uint32_t rate = dt ? (pkts - prevPkts) * 1000 / dt : 0;
-  prevPkts = pkts;
+  const uint32_t udpRate = dt ? (udp - prevUdp) * 1000 / dt : 0;
+  const uint32_t usbRate = dt ? (usb - prevUsb) * 1000 / dt : 0;
+  prevUdp = udp;
+  prevUsb = usb;
   last = now;
-  Serial.printf("role=%s peers=%d udp=%u/s mesh=%s viz=%s\n", roleName(g_role), meshPeerCount(),
-                rate, meshReady() ? "up" : "off", modeName(g_screenIndex));
+  const char *viz = hasDisplay() ? modeName(g_screenIndex) : "no display";
+  Serial.printf("role=%s peers=%d udp=%u/s usb=%u/s hear=%s mesh=%s viz=%s\n", roleName(g_role),
+                meshPeerCount(), udpRate, usbRate, hearingName(audioHearing()),
+                meshReady() ? "up" : "off", viz);
 }
 
 static void noteFrame(const VizFrame &frame) {
@@ -1079,6 +1364,14 @@ static void updateUi() {
 
   const bool full = g_vizDirty;
   g_vizDirty = false;
+  if (g_screenIndex == MODE_OFF) {
+    if (full) {
+      tft.fillScreen(colBg);
+      drawModeLabel();
+    }
+    g_drawnSeq = g_viz.seq;
+    return;
+  }
   if (full) {
     clearVizArea();
     drawLufsChrome();
@@ -1102,6 +1395,10 @@ static void updateUi() {
       break;
     case MODE_WAVEFORM:
     case MODE_OSCILLOSCOPE:
+      drawWaveform();
+      break;
+    case MODE_OFF:
+      break;
     default:
       drawWaveform();
       break;
@@ -1113,12 +1410,21 @@ static void updateUi() {
 }
 
 void setup() {
+#if MMM_USB_AUDIO
+  USBSerial.begin(115200);
+  usbAudioStart();
+#else
   Serial.begin(115200);
+#endif
   delay(800);
 
+#if MMM_LED_RGB
   FastLED.addLeds<WS2812, RGB_LED_PIN, RGB>(leds, NUM_LEDS);
   FastLED.setBrightness(10);
-  setLedRaw(CRGB::Black);
+#else
+  ledcAttach(MMM_LED_PIN, 5000, 8);
+#endif
+  setLedRaw(0, 0, 0);
 
   buildHostname();
   loadSettings();
@@ -1128,8 +1434,9 @@ void setup() {
   setupDisplay();
   connectWifi();
   publishIdentity(false);
-  meshBegin(onMeshConfig, onMeshClaim, onMeshMode, onMeshRole);
+  meshBegin(onMeshConfig, onMeshClaim, onMeshMode, onMeshRole, onMeshInput);
   audioSetVizMode((uint8_t)g_screenIndex);
+  audioSetInput(g_input);
   audioBegin(g_role == ROLE_CONDUCTOR);
   setupArduinoOta();
   setupWebUi();
