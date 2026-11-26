@@ -1,0 +1,3 @@
+[submodule "MiniMetersModular/arduino-audio-tools"]
+	path = MiniMetersModular/arduino-audio-tools
+	url = https://github.com/pschatzmann/arduino-audio-tools.git

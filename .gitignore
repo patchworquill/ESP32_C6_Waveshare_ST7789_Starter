@@ -1,1 +1,8 @@
 .pio/
+.DS_Store
+.venv/
+ESPokedex/sdkconfig.esp32c6
+assets_src/
+ESPokedex/build_assets/
+MiniMetersModular/include/secrets.h
+MiniMetersModular/.pio/
