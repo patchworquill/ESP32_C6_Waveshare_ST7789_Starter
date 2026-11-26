@@ -1,12 +1,16 @@
 #include <Arduino.h>
-#include <WiFi.h>
-#include <WebServer.h>
 #include <ArduinoOTA.h>
 #include <ElegantOTA.h>
 #include <FastLED.h>
-#include <math.h>
+#include <Preferences.h>
+#include <WebServer.h>
+#include <WiFi.h>
+#include <string.h>
 
 #include "LGFX_Waveshare_C6_147.hpp"
+#include "audio_in.h"
+#include "mesh.h"
+#include "mmm_proto.h"
 #include "secrets.h"
 
 #ifndef FIRMWARE_VERSION
@@ -17,40 +21,36 @@ static const char *kFirmwareVersion = FIRMWARE_VERSION;
 
 static WebServer server(80);
 static LGFX tft;
+static Preferences prefs;
 
 #define RGB_LED_PIN 8
 #define NUM_LEDS 1
 static CRGB leds[NUM_LEDS];
 
-static const CRGB kIdleColor = CRGB(255, 69, 0);
-
-// Display backlight: default 30%, hard cap 50%
+// Display backlight stays at a fixed modest level. The web control is the
+// onboard RGB LED, which is bright enough to wash out the panel if left at 100%.
 static const uint8_t kDisplayBrightnessPercent = 30;
 static const uint8_t kDisplayBrightnessMaxPercent = 50;
 
-// Pulse / Direct-style palette
 static uint16_t colBg;
 static uint16_t colBgAccent;
 static uint16_t colPrimary;
 static uint16_t colText;
 static uint16_t colMuted;
-static uint16_t colLufs;
 
 static const int kScreenW = 320;
 static const int kScreenH = 172;
 static const int kLufsW = 48;
-static const int kVizW = kScreenW - kLufsW;  // 272
+static const int kVizW = kScreenW - kLufsW;
+static const int kPlotTop = 12;
 static const uint32_t kInfoOverlayMs = 5000;
-static const uint32_t kVizFrameMs = 50;  // ~20 Hz
 
-enum VizMode : int {
-  MODE_SPECTRUM = 0,
-  MODE_STEREOGRAM,
-  MODE_SPECTROGRAM,
-  MODE_WAVEFORM,
-  MODE_OSCILLOSCOPE,
-  MODE_COUNT
-};
+// WebServer only accepts clients inside handleClient(). A full-frame SPI blit
+// holds this core long enough that browsers time out, and yield() does not
+// drain the TCP stack. Keep each draw to a few milliseconds and leave the
+// rest of this slice for the network. 50 ms is ~20 fps, which is enough for
+// these meters; drop it for smoother motion once the page still feels quick.
+static const uint32_t kVizFrameMs = 50;
 
 static const char *kModeNames[MODE_COUNT] = {
     "Spectrum",
@@ -62,17 +62,55 @@ static const char *kModeNames[MODE_COUNT] = {
 
 static char hostname[32];
 static int g_screenIndex = MODE_SPECTRUM;
+static uint8_t g_role = ROLE_NODE;
+static uint8_t g_ledR = 255;
+static uint8_t g_ledG = 69;
+static uint8_t g_ledB = 0;
+static uint8_t g_ledBri = 4;
+static uint32_t g_rev = 0;
+static uint32_t g_claimGuardUntil = 0;
+
 static bool g_showInfo = false;
 static uint32_t g_infoUntilMs = 0;
 static bool g_vizDirty = true;
-static uint32_t g_animPhase = 0;
+static VizFrame g_viz;
+static uint32_t g_drawnSeq = 0xffffffff;
 
-// Spectrogram scroll buffer: one column of heights (0..kScreenH-1 intensity proxy)
-static const int kSpecCols = kVizW;
-static uint8_t g_specCols[kSpecCols];
+static int g_dotY[kSpecBands];
+static int g_peakY[kSpecBands];
+static bool g_specInit = false;
 static int g_specWrite = 0;
+static int g_waveY[kWavePoints];
+static bool g_waveValid = false;
+static int g_xyX[kStereoPoints];
+static int g_xyY[kStereoPoints];
+static bool g_xyValid = false;
+static int g_lufsH[3] = {-1, -1, -1};
 
-static void setLed(const CRGB &color) {
+static void serviceNet() {
+  ArduinoOTA.handle();
+  server.handleClient();
+  ElegantOTA.loop();
+}
+
+static int clampInt(int v, int lo, int hi) {
+  if (v < lo) {
+    return lo;
+  }
+  if (v > hi) {
+    return hi;
+  }
+  return v;
+}
+
+static void applyLed() {
+  const uint8_t scale = (uint8_t)((g_ledBri * 255) / 100);
+  FastLED.setBrightness(scale);
+  leds[0] = CRGB(g_ledR, g_ledG, g_ledB);
+  FastLED.show();
+}
+
+static void setLedRaw(const CRGB &color) {
   leds[0] = color;
   FastLED.show();
 }
@@ -81,12 +119,12 @@ static uint8_t displayBrightnessByte(uint8_t percent) {
   if (percent > kDisplayBrightnessMaxPercent) {
     percent = kDisplayBrightnessMaxPercent;
   }
-  return static_cast<uint8_t>((255 * percent) / 100);
+  return (uint8_t)((255 * percent) / 100);
 }
 
 static void buildHostname() {
   uint64_t mac = ESP.getEfuseMac();
-  uint16_t suffix = static_cast<uint16_t>(mac & 0xFFFF);
+  uint16_t suffix = (uint16_t)(mac & 0xFFFF);
   snprintf(hostname, sizeof(hostname), "mmm-%04x", suffix);
 }
 
@@ -96,7 +134,6 @@ static void initPalette() {
   colPrimary = tft.color565(172, 192, 222);
   colText = tft.color565(255, 255, 255);
   colMuted = tft.color565(86, 96, 111);
-  colLufs = tft.color565(255, 255, 255);
 }
 
 static void useMonoFont() {
@@ -112,39 +149,164 @@ static const char *modeName(int index) {
   return kModeNames[index];
 }
 
+static const char *roleName(uint8_t role) {
+  return role == ROLE_CONDUCTOR ? "conductor" : "node";
+}
+
+static void publishIdentity(bool announce) {
+  meshSetIdentity(hostname, g_role, (uint8_t)g_screenIndex, g_ledR, g_ledG, g_ledB, g_ledBri,
+                  g_rev);
+  if (announce) {
+    meshAnnounce();
+  }
+}
+
+static void saveSettings() {
+  if (!prefs.begin("mmm", false)) {
+    Serial.println("NVS open failed");
+    return;
+  }
+  prefs.putUChar("mode", (uint8_t)g_screenIndex);
+  prefs.putUChar("led_r", g_ledR);
+  prefs.putUChar("led_g", g_ledG);
+  prefs.putUChar("led_b", g_ledB);
+  prefs.putUChar("led_bri", g_ledBri);
+  prefs.putUChar("role", g_role);
+  prefs.putUInt("rev", g_rev);
+  prefs.end();
+}
+
+static void loadSettings() {
+  if (!prefs.begin("mmm", true)) {
+    return;
+  }
+  g_screenIndex = prefs.getUChar("mode", MODE_SPECTRUM);
+  g_ledR = prefs.getUChar("led_r", 255);
+  g_ledG = prefs.getUChar("led_g", 69);
+  g_ledB = prefs.getUChar("led_b", 0);
+  g_ledBri = prefs.getUChar("led_bri", 4);
+  g_role = prefs.getUChar("role", ROLE_NODE);
+  g_rev = prefs.getUInt("rev", 0);
+  prefs.end();
+  if (g_screenIndex < 0 || g_screenIndex >= MODE_COUNT) {
+    g_screenIndex = MODE_SPECTRUM;
+  }
+  if (g_role != ROLE_CONDUCTOR) {
+    g_role = ROLE_NODE;
+  }
+  if (g_ledBri > 100) {
+    g_ledBri = 100;
+  }
+}
+
 static void setScreen(int index) {
-  if (index < 0) {
-    index = 0;
+  index = clampInt(index, 0, MODE_COUNT - 1);
+  if (g_screenIndex == index) {
+    return;
   }
-  if (index >= MODE_COUNT) {
-    index = MODE_COUNT - 1;
+  g_screenIndex = index;
+  g_vizDirty = true;
+  audioSetVizMode((uint8_t)g_screenIndex);
+}
+
+static void showWaiting() {
+  memset(&g_viz, 0, sizeof(g_viz));
+  g_drawnSeq = 0xffffffff;
+  g_vizDirty = true;
+}
+
+static void applyShared(int mode, uint8_t r, uint8_t g, uint8_t b, uint8_t bri, uint32_t rev,
+                        bool broadcast) {
+  g_ledR = r;
+  g_ledG = g;
+  g_ledB = b;
+  g_ledBri = bri;
+  g_rev = rev;
+  setScreen(mode);
+  applyLed();
+  saveSettings();
+  publishIdentity(broadcast);
+  if (broadcast) {
+    meshSendConfig();
   }
-  if (g_screenIndex != index) {
-    g_screenIndex = index;
-    g_vizDirty = true;
+}
+
+static void onMeshConfig(uint8_t mode, uint8_t r, uint8_t g, uint8_t b, uint8_t bri, uint32_t rev) {
+  if (mode >= MODE_COUNT || rev <= g_rev) {
+    return;
+  }
+  Serial.printf("mesh config rev=%u mode=%u led=%u,%u,%u bri=%u\n", rev, mode, r, g, b, bri);
+  applyShared(mode, r, g, b, bri, rev, false);
+}
+
+static void becomeNode() {
+  if (g_role != ROLE_CONDUCTOR) {
+    return;
+  }
+  Serial.println("mesh: now a node");
+  g_role = ROLE_NODE;
+  audioSetConductor(false);
+  g_vizDirty = true;
+  saveSettings();
+  publishIdentity(true);
+}
+
+static void onMeshClaim() {
+  if ((int32_t)(millis() - g_claimGuardUntil) < 0) {
+    return;
+  }
+  becomeNode();
+}
+
+static void resolveConductorRole(uint32_t now) {
+  if (g_role != ROLE_CONDUCTOR) {
+    return;
+  }
+  if ((int32_t)(now - g_claimGuardUntil) < 0) {
+    return;
+  }
+  if (meshOtherConductorOutranksUs()) {
+    Serial.println("mesh: deferring to the other conductor");
+    becomeNode();
   }
 }
 
 static void drawModeLabel() {
+  tft.fillRect(0, 0, kVizW, kPlotTop, colBg);
   useMonoFont();
   tft.setTextColor(colMuted, colBg);
-  tft.setCursor(4, 4);
+  tft.setCursor(4, 3);
   tft.print(modeName(g_screenIndex));
+  if (!g_viz.live) {
+    tft.print("  no audio");
+  }
+  if (g_role == ROLE_CONDUCTOR) {
+    tft.setCursor(kVizW - 10, 3);
+    tft.setTextColor(colMuted, colBg);
+    tft.print("C");
+  }
 }
 
-static void drawLufsStrip() {
+static void drawLufsChrome() {
   const int x0 = kVizW;
   tft.fillRect(x0, 0, kLufsW, kScreenH, colBgAccent);
   tft.drawFastVLine(x0, 0, kScreenH, colMuted);
-
-  // Dummy M / S / I levels (animated)
-  const float t = g_animPhase * 0.07f;
-  const float levels[3] = {
-      0.55f + 0.35f * sinf(t),
-      0.40f + 0.30f * sinf(t * 1.3f + 1.0f),
-      0.62f + 0.15f * sinf(t * 0.4f + 2.0f),
-  };
+  useMonoFont();
+  tft.setTextColor(colMuted, colBgAccent);
   const char *labels[3] = {"M", "S", "I"};
+  const int barW = 10;
+  const int gap = 4;
+  const int startX = x0 + 6;
+  for (int i = 0; i < 3; ++i) {
+    const int bx = startX + i * (barW + gap);
+    tft.setCursor(bx + 2, 3);
+    tft.print(labels[i]);
+  }
+}
+
+static void drawLufsBars() {
+  const uint8_t levels[3] = {g_viz.lufsM, g_viz.lufsS, g_viz.lufsI};
+  const int x0 = kVizW;
   const int barW = 10;
   const int gap = 4;
   const int topPad = 14;
@@ -152,181 +314,192 @@ static void drawLufsStrip() {
   const int barHMax = kScreenH - topPad - botPad;
   const int startX = x0 + 6;
 
-  useMonoFont();
   for (int i = 0; i < 3; ++i) {
+    const int h = (int)levels[i] * barHMax / 255;
     const int bx = startX + i * (barW + gap);
-    const int h = static_cast<int>(levels[i] * barHMax);
-    const int by = kScreenH - botPad - h;
-    tft.fillRect(bx, topPad, barW, barHMax, colBg);
-    tft.fillRect(bx, by, barW, h, colLufs);
-    tft.setTextColor(colMuted, colBgAccent);
-    tft.setCursor(bx + 2, 3);
-    tft.print(labels[i]);
+    const int prev = g_lufsH[i];
+    if (prev < 0) {
+      tft.fillRect(bx, topPad, barW, barHMax, colBg);
+      if (h > 0) {
+        tft.fillRect(bx, kScreenH - botPad - h, barW, h, colPrimary);
+      }
+    } else if (h != prev) {
+      if (h > prev) {
+        tft.fillRect(bx, kScreenH - botPad - h, barW, h - prev, colPrimary);
+      } else {
+        tft.fillRect(bx, kScreenH - botPad - prev, barW, prev - h, colBg);
+      }
+    }
+    g_lufsH[i] = h;
   }
 }
 
+// Squared so the noise floor stays near black, and the stops stay well under
+// full RGB. A solid bright column is what made the old spectrogram bloom.
 static uint16_t heatColor(uint8_t v) {
-  // Simple blue -> cyan -> green -> yellow -> red
-  const float t = v / 255.0f;
-  uint8_t r, g, b;
+  float t = v / 255.0f;
+  t = t * t;
+  uint8_t r = 0;
+  uint8_t g = 0;
+  uint8_t b = 0;
   if (t < 0.25f) {
     const float u = t / 0.25f;
-    r = 0;
-    g = static_cast<uint8_t>(u * 180);
-    b = 255;
-  } else if (t < 0.5f) {
+    b = (uint8_t)(90 * u);
+    g = (uint8_t)(20 * u);
+  } else if (t < 0.50f) {
     const float u = (t - 0.25f) / 0.25f;
-    r = 0;
-    g = 180 + static_cast<uint8_t>(u * 75);
-    b = 255 - static_cast<uint8_t>(u * 255);
+    b = (uint8_t)(90 * (1.0f - u));
+    g = (uint8_t)(20 + 110 * u);
   } else if (t < 0.75f) {
-    const float u = (t - 0.5f) / 0.25f;
-    r = static_cast<uint8_t>(u * 255);
-    g = 255;
-    b = 0;
+    const float u = (t - 0.50f) / 0.25f;
+    g = (uint8_t)(130 + 30 * u);
+    r = (uint8_t)(150 * u);
   } else {
     const float u = (t - 0.75f) / 0.25f;
-    r = 255;
-    g = 255 - static_cast<uint8_t>(u * 255);
-    b = 0;
+    r = (uint8_t)(150 + 30 * u);
+    g = (uint8_t)(160 * (1.0f - u));
   }
   return tft.color565(r, g, b);
 }
 
 static void drawSpectrum() {
-  tft.fillRect(0, 0, kVizW, kScreenH, colBg);
-  const int bars = 32;
-  const int gap = 1;
-  const int barW = (kVizW - 8 - (bars - 1) * gap) / bars;
-  const float t = g_animPhase * 0.08f;
-
-  for (int i = 0; i < bars; ++i) {
-    const float n = i / static_cast<float>(bars - 1);
-    float hNorm = 0.25f + 0.55f * fabsf(sinf(t + n * 4.2f)) * (1.0f - 0.35f * n);
-    hNorm += 0.12f * fabsf(sinf(t * 1.7f + i * 0.4f));
-    if (hNorm > 1.0f) {
-      hNorm = 1.0f;
-    }
-    const int h = static_cast<int>(hNorm * (kScreenH - 20));
-    const int x = 4 + i * (barW + gap);
-    const int y = kScreenH - 4 - h;
-    tft.fillRect(x, y, barW, h, colPrimary);
-    // Peak tick
-    tft.drawFastHLine(x, y - 2, barW, colText);
+  const int n = kSpecBands;
+  const int slot = kVizW / n;
+  const int dot = 3;
+  const int base = kScreenH - 5;
+  const int maxH = base - kPlotTop - 2;
+  if (!g_specInit) {
+    tft.drawFastHLine(0, kScreenH - 2, kVizW, colMuted);
   }
-  drawModeLabel();
+  for (int i = 0; i < n; ++i) {
+    int h = (int)g_viz.spectrum[i] * maxH / 255;
+    int y = base - h;
+    int x = i * slot + (slot - dot) / 2;
+    int peak = y;
+    if (g_specInit) {
+      peak = g_peakY[i];
+      if (y < peak) {
+        peak = y;
+      } else if (peak < y) {
+        peak += 2;
+        if (peak > y) {
+          peak = y;
+        }
+      }
+      if (g_dotY[i] == y && g_peakY[i] == peak) {
+        continue;
+      }
+      tft.fillRect(x, g_dotY[i], dot, dot, colBg);
+      tft.drawFastHLine(x, g_peakY[i], dot, colBg);
+    }
+    tft.fillRect(x, y, dot, dot, colPrimary);
+    if (peak + 2 < y) {
+      tft.drawFastHLine(x, peak, dot, colText);
+    }
+    g_dotY[i] = y;
+    g_peakY[i] = peak;
+  }
+  g_specInit = true;
 }
 
-static void drawStereogram() {
-  tft.fillRect(0, 0, kVizW, kScreenH, colBg);
-  const int cx = kVizW / 2;
-  const int cy = kScreenH / 2;
-  const float t = g_animPhase * 0.05f;
-  const float a = 70.0f + 10.0f * sinf(t * 0.3f);
-  const float b = 55.0f + 8.0f * cosf(t * 0.4f);
-  int prevX = cx;
-  int prevY = cy;
-
-  for (int i = 0; i <= 180; ++i) {
-    const float u = i / 180.0f * 6.2831853f;
-    const float x = cx + a * sinf(u + t);
-    const float y = cy + b * sinf(2.0f * u + t * 1.3f);
-    const int ix = static_cast<int>(x);
-    const int iy = static_cast<int>(y);
-    if (i > 0) {
-      tft.drawLine(prevX, prevY, ix, iy, colPrimary);
-    }
-    prevX = ix;
-    prevY = iy;
+static void drawSpectrogramColumn() {
+  if (!g_viz.live) {
+    return;
   }
-  tft.drawFastHLine(8, cy, kVizW - 16, colMuted);
-  tft.drawFastVLine(cx, 8, kScreenH - 16, colMuted);
-  drawModeLabel();
+  const int x = g_specWrite;
+  if (x < 0 || x >= kVizW) {
+    return;
+  }
+  const int plotH = kScreenH - kPlotTop;
+  for (int i = 0; i < kSpectroBins; ++i) {
+    const int y0 = (i * plotH) / kSpectroBins;
+    const int y1 = ((i + 1) * plotH) / kSpectroBins;
+    const int top = kScreenH - y1;
+    int h = y1 - y0;
+    if (h < 1) {
+      h = 1;
+    }
+    tft.drawFastVLine(x, top, h, heatColor(g_viz.spectro[i]));
+  }
+  g_specWrite = (g_specWrite + 1) % kVizW;
 }
 
-static void drawSpectrogram() {
-  // Push a new dummy column
-  const float t = g_animPhase * 0.09f;
-  uint8_t v = static_cast<uint8_t>(
-      40 + 180 * fabsf(sinf(t)) * (0.5f + 0.5f * fabsf(sinf(t * 2.1f))));
-  g_specCols[g_specWrite] = v;
-  g_specWrite = (g_specWrite + 1) % kSpecCols;
+static int plotMid() {
+  return kPlotTop + (kScreenH - kPlotTop) / 2;
+}
 
-  for (int x = 0; x < kVizW; ++x) {
-    const int idx = (g_specWrite + x) % kSpecCols;
-    const uint8_t c = g_specCols[idx];
-    const uint16_t color = heatColor(c);
-    // Draw vertical gradient band based on intensity
-    const int h = 8 + (c * (kScreenH - 8)) / 255;
-    const int y0 = kScreenH - h;
-    if (y0 > 0) {
-      tft.drawFastVLine(x, 0, y0, colBg);
-    }
-    tft.drawFastVLine(x, y0, h, color);
+static int waveX(int i) {
+  return (i * (kVizW - 1)) / (kWavePoints - 1);
+}
+
+static int waveY(int8_t sample) {
+  const int mid = plotMid();
+  const int amp = (kScreenH - kPlotTop) * 36 / 100;
+  return clampInt(mid - ((int)sample * amp) / 127, kPlotTop + 2, kScreenH - 3);
+}
+
+static void strokeWave(const int *ys, uint16_t color) {
+  for (int i = 1; i < kWavePoints; ++i) {
+    tft.drawLine(waveX(i - 1), ys[i - 1], waveX(i), ys[i], color);
   }
-  drawModeLabel();
 }
 
 static void drawWaveform() {
-  tft.fillRect(0, 0, kVizW, kScreenH, colBg);
-  tft.drawFastHLine(0, kScreenH / 2, kVizW, colMuted);
-  const float t = g_animPhase * 0.12f;
-  int prevY = kScreenH / 2;
-
-  for (int x = 0; x < kVizW; ++x) {
-    const float n = x / static_cast<float>(kVizW);
-    float y = 0.5f * sinf(t + n * 18.0f);
-    y += 0.25f * sinf(t * 1.7f + n * 37.0f);
-    y += 0.12f * sinf(t * 0.5f + n * 7.0f);
-    const int iy = kScreenH / 2 + static_cast<int>(y * (kScreenH * 0.42f));
-    if (x > 0) {
-      tft.drawLine(x - 1, prevY, x, iy, colPrimary);
-    }
-    prevY = iy;
+  int ys[kWavePoints];
+  for (int i = 0; i < kWavePoints; ++i) {
+    ys[i] = waveY(g_viz.wave[i]);
   }
-  drawModeLabel();
+  if (g_waveValid) {
+    strokeWave(g_waveY, colBg);
+  }
+  tft.drawFastHLine(0, plotMid(), kVizW, colMuted);
+  strokeWave(ys, colPrimary);
+  memcpy(g_waveY, ys, sizeof(ys));
+  g_waveValid = true;
 }
 
-static void drawOscilloscope() {
-  tft.fillRect(0, 0, kVizW, kScreenH, colBg);
-  tft.drawFastHLine(0, kScreenH / 2, kVizW, colMuted);
-  const float t = g_animPhase * 0.15f;
-  const float freq = 2.0f + 0.5f * sinf(t * 0.2f);
-  int prevY = kScreenH / 2;
-
-  for (int x = 0; x < kVizW; ++x) {
-    const float n = x / static_cast<float>(kVizW);
-    const float y = sinf(t + n * freq * 6.2831853f);
-    const int iy = kScreenH / 2 + static_cast<int>(y * (kScreenH * 0.38f));
-    if (x > 0) {
-      tft.drawLine(x - 1, prevY, x, iy, colPrimary);
-    }
-    prevY = iy;
-  }
-  drawModeLabel();
+static void stereoPoint(int i, int *x, int *y) {
+  const int cx = kVizW / 2;
+  const int cy = plotMid();
+  *x = clampInt(cx + ((int)g_viz.xyL[i] * (cx - 10)) / 127, 1, kVizW - 2);
+  *y = clampInt(cy - ((int)g_viz.xyR[i] * (cy - kPlotTop - 8)) / 127, kPlotTop + 1, kScreenH - 2);
 }
 
-static void drawVizFrame() {
-  switch (g_screenIndex) {
-    case MODE_SPECTRUM:
-      drawSpectrum();
-      break;
-    case MODE_STEREOGRAM:
-      drawStereogram();
-      break;
-    case MODE_SPECTROGRAM:
-      drawSpectrogram();
-      break;
-    case MODE_WAVEFORM:
-      drawWaveform();
-      break;
-    case MODE_OSCILLOSCOPE:
-    default:
-      drawOscilloscope();
-      break;
+static void strokeXy(const int *xs, const int *ys, uint16_t color) {
+  for (int i = 1; i < kStereoPoints; ++i) {
+    tft.drawLine(xs[i - 1], ys[i - 1], xs[i], ys[i], color);
   }
-  drawLufsStrip();
-  g_vizDirty = false;
+}
+
+static void drawStereogram() {
+  int xs[kStereoPoints];
+  int ys[kStereoPoints];
+  for (int i = 0; i < kStereoPoints; ++i) {
+    stereoPoint(i, &xs[i], &ys[i]);
+  }
+  if (g_xyValid) {
+    strokeXy(g_xyX, g_xyY, colBg);
+  }
+  const int cx = kVizW / 2;
+  const int cy = plotMid();
+  tft.drawFastHLine(8, cy, kVizW - 16, colMuted);
+  tft.drawFastVLine(cx, kPlotTop + 2, kScreenH - kPlotTop - 6, colMuted);
+  strokeXy(xs, ys, colPrimary);
+  memcpy(g_xyX, xs, sizeof(xs));
+  memcpy(g_xyY, ys, sizeof(ys));
+  g_xyValid = true;
+}
+
+static void clearVizArea() {
+  const int band = 24;
+  for (int y = 0; y < kScreenH; y += band) {
+    int h = band;
+    if (y + h > kScreenH) {
+      h = kScreenH - y;
+    }
+    tft.fillRect(0, y, kVizW, h, colBg);
+    serviceNet();
+  }
 }
 
 static void drawInfoOverlay(const char *wifiLine) {
@@ -348,25 +521,26 @@ static void drawInfoOverlay(const char *wifiLine) {
   tft.setCursor(8, 8);
   tft.print("MiniMeters Modular");
 
-  label(8, 32, "firmware");
-  value(8, 44, kFirmwareVersion);
+  label(8, 28, "firmware");
+  value(8, 40, kFirmwareVersion);
 
-  label(8, 64, "hostname");
-  value(8, 76, hostname);
+  label(8, 56, "hostname");
+  value(8, 68, hostname);
 
-  label(8, 96, "network");
-  value(8, 108, wifiLine);
+  label(8, 84, "network");
+  value(8, 96, wifiLine);
 
-  label(8, 128, "viz");
-  value(8, 140, modeName(g_screenIndex));
+  char vizLine[40];
+  snprintf(vizLine, sizeof(vizLine), "%s · %s", modeName(g_screenIndex), roleName(g_role));
+  label(8, 112, "viz");
+  value(8, 124, vizLine);
 
   tft.setTextColor(colPrimary, colBg);
-  tft.setCursor(8, 158);
+  tft.setCursor(8, 148);
   tft.printf("http://%s/control", WiFi.localIP().toString().c_str());
 }
 
 static void drawBootConnecting(const char *wifiLine) {
-  // Lightweight status during Wi-Fi connect (before palette-driven UI loop)
   tft.fillScreen(TFT_BLACK);
   tft.setFont(&fonts::Font0);
   tft.setTextSize(1);
@@ -381,15 +555,15 @@ static void drawBootConnecting(const char *wifiLine) {
 
 static void setupDisplay() {
   tft.init();
-  tft.setRotation(1);  // USB connector on the right
+  tft.setRotation(1);
   tft.setBrightness(displayBrightnessByte(kDisplayBrightnessPercent));
   initPalette();
-  memset(g_specCols, 0, sizeof(g_specCols));
   drawBootConnecting("wifi...");
 }
 
 static void connectWifi() {
   WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
   WiFi.setHostname(hostname);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
@@ -398,20 +572,22 @@ static void connectWifi() {
   while (WiFi.status() != WL_CONNECTED) {
     delay(250);
     Serial.print('.');
-    setLed(kIdleColor);
-    delay(50);
-    setLed(CRGB::Black);
+    applyLed();
+    delay(40);
+    setLedRaw(CRGB::Black);
     if (millis() - started > 30000) {
-      Serial.println("\nWiFi connect timeout — retrying");
+      Serial.println("\nWiFi connect timeout, retrying");
       drawBootConnecting("wifi retry...");
       WiFi.disconnect(true);
       delay(500);
       WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
     }
   }
+  WiFi.setSleep(false);
   Serial.println();
-  Serial.printf("WiFi OK  ip=%s  rssi=%d\n",
-                WiFi.localIP().toString().c_str(), WiFi.RSSI());
+  Serial.printf("WiFi OK  ip=%s  rssi=%d  channel=%d\n", WiFi.localIP().toString().c_str(),
+                WiFi.RSSI(), WiFi.channel());
+  applyLed();
 }
 
 static void setupArduinoOta() {
@@ -421,21 +597,21 @@ static void setupArduinoOta() {
   ArduinoOTA.onStart([]() {
     const char *type = (ArduinoOTA.getCommand() == U_FLASH) ? "firmware" : "filesystem";
     Serial.printf("ArduinoOTA start (%s)\n", type);
-    setLed(kIdleColor);
+    applyLed();
     g_showInfo = true;
-    g_infoUntilMs = millis() + 600000;  // hold until end/error
+    g_infoUntilMs = millis() + 600000;
     drawInfoOverlay("ArduinoOTA...");
   });
   ArduinoOTA.onEnd([]() {
     Serial.println("\nArduinoOTA end");
-    setLed(kIdleColor);
+    applyLed();
   });
   ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
     Serial.printf("ArduinoOTA progress: %u%%\r", (progress * 100) / total);
   });
   ArduinoOTA.onError([](ota_error_t error) {
     Serial.printf("ArduinoOTA error[%u]\n", error);
-    setLed(CRGB(25, 0, 0));
+    setLedRaw(CRGB(80, 0, 0));
     drawInfoOverlay("OTA error");
   });
 
@@ -461,10 +637,14 @@ static String htmlEscape(const String &in) {
   return out;
 }
 
+static void sendNoStore() {
+  server.sendHeader("Cache-Control", "no-store");
+}
+
 static void sendStatusPage() {
   String ip = WiFi.localIP().toString();
   String body;
-  body.reserve(768);
+  body.reserve(1024);
   body += F("<!doctype html><html><head><meta charset=utf-8>");
   body += F("<meta name=viewport content=\"width=device-width,initial-scale=1\">");
   body += F("<title>MiniMeters Modular</title><style>");
@@ -476,27 +656,60 @@ static void sendStatusPage() {
   body += htmlEscape(kFirmwareVersion);
   body += F("</p><p class=muted>hostname</p><p class=v>");
   body += htmlEscape(hostname);
+  body += F("</p><p class=muted>role</p><p class=v>");
+  body += roleName(g_role);
   body += F("</p><p class=muted>network</p><p class=v>");
   body += htmlEscape(ip);
   body += F("</p><p class=muted>viz</p><p class=v>");
   body += htmlEscape(modeName(g_screenIndex));
-  body += F("</p><p><a href=/control>control</a> &nbsp; <a href=/update>ota /update</a></p>");
+  body += F("</p><p class=muted>mesh</p><p class=v>");
+  body += meshReady() ? "esp-now" : "offline";
+  body += F(" · ");
+  body += String(meshPeerCount());
+  body += F(" peers</p>");
+  if (g_role == ROLE_CONDUCTOR) {
+    body += F("<p class=muted>audio</p><p class=v>udp://");
+    body += htmlEscape(ip);
+    body += F(":");
+    body += String(kAudioUdpPort);
+    body += F("</p>");
+  }
+  body += F("<p><a href=/control>control</a> &nbsp; <a href=/update>ota /update</a></p>");
   body += F("</body></html>");
+  sendNoStore();
   server.send(200, "text/html", body);
 }
 
 static void sendControlPage() {
+  String ip = WiFi.localIP().toString();
+  char color[8];
+  snprintf(color, sizeof(color), "#%02x%02x%02x", g_ledR, g_ledG, g_ledB);
+
   String body;
-  body.reserve(1024);
+  body.reserve(4096);
   body += F("<!doctype html><html><head><meta charset=utf-8>");
   body += F("<meta name=viewport content=\"width=device-width,initial-scale=1\">");
   body += F("<title>Control — MiniMeters</title><style>");
   body += F("body{background:#000;color:#fff;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;");
   body += F("margin:2rem;line-height:1.5} a{color:#ACC0DE;text-decoration:none}");
-  body += F(".muted{color:#56606F} .btn{display:block;padding:.75rem 1rem;margin:.4rem 0;");
-  body += F("border:1px solid #56606F;color:#ACC0DE} .btn.active{background:#2B3037;border-color:#ACC0DE;color:#fff}");
+  body += F(".muted{color:#56606F} .v{color:#ACC0DE}");
+  body += F(".btn,button.btn{display:block;padding:.75rem 1rem;margin:.4rem 0;width:100%;box-sizing:border-box;");
+  body += F("border:1px solid #56606F;color:#ACC0DE;background:#000;font:inherit;text-align:left;cursor:pointer}");
+  body += F(".btn.active{background:#2B3037;border-color:#ACC0DE;color:#fff}");
+  body += F("input[type=color]{background:#000;border:1px solid #56606F;height:2.4rem;width:4rem;padding:0}");
+  body += F("input[type=range]{width:100%;accent-color:#ACC0DE}");
+  body += F(".ver{color:#56606F;font-size:11px;margin-top:2.5rem}");
   body += F("</style></head><body>");
   body += F("<h1>Control</h1>");
+  body += F("<p>");
+  body += htmlEscape(hostname);
+  body += F(" <span class=muted>this node · ");
+  body += roleName(g_role);
+  body += F(" · ");
+  body += htmlEscape(ip);
+  body += F("</span></p>");
+  body += F("<p class=muted>Mode, LED color, and brightness are saved here and pushed to every node.</p>");
+
   body += F("<p class=muted>viz mode</p>");
   for (int i = 0; i < MODE_COUNT; ++i) {
     body += F("<a class=\"btn");
@@ -512,17 +725,173 @@ static void sendControlPage() {
     }
     body += F("</a>");
   }
+
+  body += F("<form action=/control method=get>");
+  body += F("<p class=muted>led</p>");
+  body += F("<p><input type=color name=led value=\"");
+  body += color;
+  body += F("\"></p>");
+  body += F("<p class=muted>brightness <span id=bv>");
+  body += String(g_ledBri);
+  body += F("</span>%</p>");
+  body += F("<input id=bri type=range name=bri min=0 max=100 value=\"");
+  body += String(g_ledBri);
+  body += F("\">");
+  body += F("<button class=btn type=submit>Apply LED to mesh</button>");
+  body += F("</form>");
+  body += F("<script>var b=document.getElementById('bri'),o=document.getElementById('bv');");
+  body += F("b.oninput=function(){o.textContent=b.value}</script>");
+
+  body += F("<p class=muted>role</p>");
+  body += F("<a class=\"btn");
+  if (g_role == ROLE_CONDUCTOR) {
+    body += F(" active");
+  }
+  body += F("\" href=\"/control?role=conductor\">Conductor</a>");
+  body += F("<a class=\"btn");
+  if (g_role == ROLE_NODE) {
+    body += F(" active");
+  }
+  body += F("\" href=\"/control?role=node\">Node</a>");
+  body += F("<p class=muted>One conductor runs the FFT and feeds the other nodes. Choosing Conductor demotes the rest.</p>");
+  if (g_role == ROLE_CONDUCTOR) {
+    body += F("<p class=v>udp://");
+    body += htmlEscape(ip);
+    body += F(":");
+    body += String(kAudioUdpPort);
+    body += F("</p>");
+  }
+
+  body += F("<p class=muted>nodes</p>");
+  if (!meshReady()) {
+    body += F("<p class=muted>ESP-NOW is offline on this node.</p>");
+  } else {
+    MeshPeerInfo peers[8];
+    const int n = meshCopyPeers(peers, 8);
+    if (n == 0) {
+      body += F("<p class=muted>none yet</p>");
+    }
+    for (int i = 0; i < n; ++i) {
+      char ipbuf[20];
+      snprintf(ipbuf, sizeof(ipbuf), "%u.%u.%u.%u", peers[i].ip[0], peers[i].ip[1], peers[i].ip[2],
+               peers[i].ip[3]);
+      body += F("<p>");
+      body += htmlEscape(peers[i].name[0] ? peers[i].name : "?");
+      body += F(" <span class=muted>");
+      body += roleName(peers[i].role);
+      body += F(" · ");
+      body += htmlEscape(modeName(peers[i].mode));
+      body += F(" · ");
+      body += String((int)peers[i].rssi);
+      body += F(" dBm</span>");
+      if (peers[i].ip[0] || peers[i].ip[1] || peers[i].ip[2] || peers[i].ip[3]) {
+        body += F(" <a href=\"http://");
+        body += ipbuf;
+        body += F("/control\">open</a>");
+      }
+      body += F("</p>");
+    }
+  }
+
   body += F("<p style=\"margin-top:1.5rem\"><a href=/>status</a></p>");
-  body += F("</body></html>");
+  body += F("<p class=ver>firmware ");
+  body += htmlEscape(kFirmwareVersion);
+  body += F("</p></body></html>");
+  sendNoStore();
   server.send(200, "text/html", body);
 }
 
+static bool parseColor(const String &in, uint8_t *r, uint8_t *g, uint8_t *b) {
+  String hex = in;
+  if (hex.startsWith("#")) {
+    hex = hex.substring(1);
+  }
+  if (hex.length() != 6) {
+    return false;
+  }
+  char buf[3] = {0, 0, 0};
+  auto byteAt = [&](int index, uint8_t *out) -> bool {
+    buf[0] = hex[index];
+    buf[1] = hex[index + 1];
+    char *end = nullptr;
+    const long v = strtol(buf, &end, 16);
+    if (end != buf + 2 || v < 0 || v > 255) {
+      return false;
+    }
+    *out = (uint8_t)v;
+    return true;
+  };
+  return byteAt(0, r) && byteAt(2, g) && byteAt(4, b);
+}
+
+static void redirectControl() {
+  server.sendHeader("Location", "/control", true);
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(302, "text/plain", "");
+}
+
 static void handleControl() {
+  bool changed = false;
+  int mode = g_screenIndex;
+  uint8_t r = g_ledR;
+  uint8_t g = g_ledG;
+  uint8_t b = g_ledB;
+  uint8_t bri = g_ledBri;
+
   if (server.hasArg("mode")) {
-    const int mode = server.arg("mode").toInt();
-    setScreen(mode);
-    server.sendHeader("Location", "/control", true);
-    server.send(302, "text/plain", "");
+    const int next = server.arg("mode").toInt();
+    if (next >= 0 && next < MODE_COUNT && next != g_screenIndex) {
+      mode = next;
+      changed = true;
+    }
+  }
+  if (server.hasArg("led")) {
+    uint8_t nr, ng, nb;
+    if (parseColor(server.arg("led"), &nr, &ng, &nb) &&
+        (nr != g_ledR || ng != g_ledG || nb != g_ledB)) {
+      r = nr;
+      g = ng;
+      b = nb;
+      changed = true;
+    }
+  }
+  if (server.hasArg("bri")) {
+    int next = server.arg("bri").toInt();
+    next = clampInt(next, 0, 100);
+    if ((uint8_t)next != g_ledBri) {
+      bri = (uint8_t)next;
+      changed = true;
+    }
+  }
+  if (changed) {
+    applyShared(mode, r, g, b, bri, g_rev + 1, true);
+  }
+
+  if (server.hasArg("role")) {
+    const String rs = server.arg("role");
+    if (rs == "conductor") {
+      g_claimGuardUntil = millis() + 3000;
+      if (g_role != ROLE_CONDUCTOR) {
+        g_role = ROLE_CONDUCTOR;
+        audioSetConductor(true);
+        saveSettings();
+        showWaiting();
+      }
+      publishIdentity(true);
+      meshSendClaim();
+    } else if (rs == "node" && g_role != ROLE_NODE) {
+      g_role = ROLE_NODE;
+      audioSetConductor(false);
+      g_vizDirty = true;
+      saveSettings();
+      publishIdentity(true);
+    }
+  }
+
+  const bool requested = server.hasArg("mode") || server.hasArg("led") || server.hasArg("bri") ||
+                        server.hasArg("role");
+  if (requested) {
+    redirectControl();
     return;
   }
   sendControlPage();
@@ -535,19 +904,20 @@ static void setupWebUi() {
   ElegantOTA.begin(&server, "ota", OTA_PASSWORD);
   ElegantOTA.onStart([]() {
     Serial.println("ElegantOTA start");
-    setLed(kIdleColor);
+    applyLed();
     g_showInfo = true;
     g_infoUntilMs = millis() + 600000;
     drawInfoOverlay("ElegantOTA...");
   });
   ElegantOTA.onEnd([](bool success) {
     Serial.printf("ElegantOTA end success=%d\n", success);
-    setLed(success ? kIdleColor : CRGB(25, 0, 0));
     if (!success) {
+      setLedRaw(CRGB(80, 0, 0));
       g_showInfo = true;
       g_infoUntilMs = millis() + 5000;
       drawInfoOverlay("OTA failed");
     } else {
+      applyLed();
       g_showInfo = false;
       g_vizDirty = true;
     }
@@ -564,31 +934,58 @@ static void printBanner() {
   Serial.printf(" version : %s\n", kFirmwareVersion);
   Serial.printf(" hostname: %s\n", hostname);
   Serial.printf(" ip      : %s\n", WiFi.localIP().toString().c_str());
+  Serial.printf(" channel : %d\n", WiFi.channel());
+  Serial.printf(" role    : %s\n", roleName(g_role));
   Serial.printf(" viz     : %s\n", modeName(g_screenIndex));
+  Serial.printf(" esp-now : %s\n", meshReady() ? "up" : "off");
+  if (g_role == ROLE_CONDUCTOR) {
+    Serial.printf(" audio   : udp://%s:%u\n", WiFi.localIP().toString().c_str(), kAudioUdpPort);
+  }
   Serial.println(" display : LovyanGFX / ST7789 172x320");
   Serial.printf(" control : http://%s/control\n", WiFi.localIP().toString().c_str());
-  Serial.printf(" ElegantOTA: http://%s/update  user=ota\n",
-                WiFi.localIP().toString().c_str());
+  Serial.printf(" ElegantOTA: http://%s/update  user=ota\n", WiFi.localIP().toString().c_str());
   Serial.println("========================================");
 }
 
-static void rgbHeartbeat() {
+static void logLink() {
   static uint32_t last = 0;
-  static bool on = false;
+  static uint32_t prevPkts = 0;
   const uint32_t now = millis();
-  if (now - last < 600) {
+  if (now - last < 3000) {
     return;
   }
+  const uint32_t pkts = audioPackets();
+  const uint32_t dt = now - last;
+  const uint32_t rate = dt ? (pkts - prevPkts) * 1000 / dt : 0;
+  prevPkts = pkts;
   last = now;
-  on = !on;
-  setLed(on ? kIdleColor : CRGB::Black);
+  Serial.printf("role=%s peers=%d udp=%u/s mesh=%s viz=%s\n", roleName(g_role), meshPeerCount(),
+                rate, meshReady() ? "up" : "off", modeName(g_screenIndex));
+}
+
+static void noteFrame(const VizFrame &frame) {
+  g_viz = frame;
+}
+
+static void publishViz() {
+  if (g_role == ROLE_CONDUCTOR) {
+    VizFrame frame;
+    if (audioTake(&frame)) {
+      noteFrame(frame);
+      meshSendViz(frame);
+    }
+  } else {
+    VizFrame frame;
+    if (meshTakeViz(&frame)) {
+      noteFrame(frame);
+    }
+  }
 }
 
 static void updateUi() {
   const uint32_t now = millis();
-
   if (g_showInfo) {
-    if (static_cast<int32_t>(now - g_infoUntilMs) >= 0) {
+    if ((int32_t)(now - g_infoUntilMs) >= 0) {
       g_showInfo = false;
       g_vizDirty = true;
     } else {
@@ -597,12 +994,51 @@ static void updateUi() {
   }
 
   static uint32_t lastFrame = 0;
-  if (!g_vizDirty && (now - lastFrame) < kVizFrameMs) {
+  const bool timeForFrame = (now - lastFrame) >= kVizFrameMs;
+  if (!g_vizDirty && !timeForFrame) {
+    return;
+  }
+
+  const bool seqNew = g_viz.seq != g_drawnSeq;
+  const bool spectrum = g_screenIndex == MODE_SPECTRUM;
+  if (!g_vizDirty && !seqNew && !spectrum) {
     return;
   }
   lastFrame = now;
-  ++g_animPhase;
-  drawVizFrame();
+
+  const bool full = g_vizDirty;
+  g_vizDirty = false;
+  if (full) {
+    clearVizArea();
+    drawLufsChrome();
+    g_specInit = false;
+    g_waveValid = false;
+    g_xyValid = false;
+    g_specWrite = 0;
+    g_lufsH[0] = g_lufsH[1] = g_lufsH[2] = -1;
+  }
+
+  tft.startWrite();
+  switch (g_screenIndex) {
+    case MODE_SPECTRUM:
+      drawSpectrum();
+      break;
+    case MODE_STEREOGRAM:
+      drawStereogram();
+      break;
+    case MODE_SPECTROGRAM:
+      drawSpectrogramColumn();
+      break;
+    case MODE_WAVEFORM:
+    case MODE_OSCILLOSCOPE:
+    default:
+      drawWaveform();
+      break;
+  }
+  drawLufsBars();
+  tft.endWrite();
+  drawModeLabel();
+  g_drawnSeq = g_viz.seq;
 }
 
 void setup() {
@@ -611,27 +1047,39 @@ void setup() {
 
   FastLED.addLeds<WS2812, RGB_LED_PIN, RGB>(leds, NUM_LEDS);
   FastLED.setBrightness(10);
-  setLed(CRGB::Black);
+  setLedRaw(CRGB::Black);
 
   buildHostname();
-  Serial.printf("Booting %s (%s)\n", hostname, kFirmwareVersion);
+  loadSettings();
+  applyLed();
+  Serial.printf("Booting %s (%s) role=%s\n", hostname, kFirmwareVersion, roleName(g_role));
 
   setupDisplay();
   connectWifi();
+  publishIdentity(false);
+  meshBegin(onMeshConfig, onMeshClaim);
+  audioSetVizMode((uint8_t)g_screenIndex);
+  audioBegin(g_role == ROLE_CONDUCTOR);
   setupArduinoOta();
   setupWebUi();
   printBanner();
 
-  setLed(kIdleColor);
+  applyLed();
   g_showInfo = true;
   g_infoUntilMs = millis() + kInfoOverlayMs;
   drawInfoOverlay(WiFi.localIP().toString().c_str());
 }
 
 void loop() {
-  ArduinoOTA.handle();
-  server.handleClient();
-  ElegantOTA.loop();
-  rgbHeartbeat();
+  serviceNet();
+  const uint32_t now = millis();
+  meshPollRx();
+  resolveConductorRole(now);
+  audioPoll(now);
+  publishViz();
+  meshPollTx(now);
   updateUi();
+  logLink();
+  serviceNet();
+  delay(1);
 }
